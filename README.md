@@ -22,7 +22,7 @@ The key insight is a **dual communication layer** problem: FL aggregation traffi
 
 ```bash
 # clone the repo
-git clone https://github.com/PLACEHOLDER/SecureRelayFL.git
+git clone https://github.com/sramharack/SecureRelayFL.git
 cd SecureRelayFL
 
 # create environment and install (pick one)
