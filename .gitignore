@@ -1,0 +1,40 @@
+# SecureRelayFL .gitignore
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ---- virtual environment ----
+.venv/
+venv/
+env/
+
+# ---- generated data (large, reproducible) ----
+data/generated/
+
+# ---- experiment outputs ----
+results/
+runs/
+wandb/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- misc ----
+*.log

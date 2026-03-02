@@ -1,0 +1,34 @@
+# SecureRelayFL — pinned dependencies for exact reproducibility
+# Generated for Python 3.12 / CUDA 12.x / Linux x86_64
+# Install:  pip install -r requirements.lock
+#
+# To regenerate after editing pyproject.toml:
+#   pip install pip-tools
+#   pip-compile --resolver=backtracking -o requirements.lock pyproject.toml
+
+# ----- data generation -----
+numpy==1.26.4
+pandas==2.2.2
+
+# ----- ML / deep learning -----
+torch==2.4.1
+torchvision==0.19.1
+scikit-learn==1.5.2
+
+# ----- federated learning -----
+flwr==1.12.0
+
+# ----- differential privacy -----
+opacus==1.5.2
+
+# ----- experiment tracking -----
+tensorboard==2.18.0
+pyyaml==6.0.2
+
+# ----- figures & analysis -----
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# ----- utilities -----
+tqdm==4.67.1
+h5py==3.11.0

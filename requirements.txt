@@ -1,0 +1,15 @@
+# SecureRelayFL — minimum requirements (loose pins)
+# For exact reproducibility use: pip install -r requirements.lock
+numpy>=1.26
+pandas>=2.1
+torch>=2.2
+torchvision>=0.17
+scikit-learn>=1.4
+flwr[simulation]>=1.7
+opacus>=1.4
+tensorboard>=2.16
+pyyaml>=6.0
+matplotlib>=3.8
+seaborn>=0.13
+tqdm>=4.66
+h5py>=3.10
