@@ -12,7 +12,7 @@ SecureRelayFL evaluates federated learning under realistic industrial network im
 
 ## Paper
 
-S. [Last Name], "Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks," *MAIN 2026 (Mediterranean Artificial Intelligence and Networking Conference)*, Palermo, Italy, July 2026.
+S. Ramharack, "Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks," *MAIN 2026 (Mediterranean Artificial Intelligence and Networking Conference)*, Palermo, Italy, July 2026.
 
 ## License
 
