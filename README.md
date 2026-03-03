@@ -6,7 +6,7 @@
 
 ## Overview
 
-Industrial facilities operating heterogeneous electrical protection systems face a data silo problem: optimizing relay settings requires fault data that operators refuse to share. This work applies **federated learning** to train collaborative protection models without centralizing proprietary data, and systematically evaluates how **realistic network impairments** (latency, packet loss, bandwidth) and **differential privacy** affect protection accuracy.
+Industrial facilities operating heterogeneous electrical protection systems face a data silo problem: optimizing relay settings requires fault data that operators refuse to share. This is especially common for industrial parks, where there are a myriad of large facilities operating at maximum load. This work applies **federated learning** to train collaborative protection models without centralizing proprietary data, and systematically evaluates how **realistic network impairments** (latency, packet loss, bandwidth) and **differential privacy** affect protection accuracy.
 
 The key insight is a **dual communication layer** problem: FL aggregation traffic shares the same industrial Ethernet carrying time-critical IEC 61850 GOOSE protection messages (sub-4 ms requirement). We analyze how these two communication requirements interact.
 
@@ -22,7 +22,7 @@ The key insight is a **dual communication layer** problem: FL aggregation traffi
 
 ```bash
 # clone the repo
-git clone https://github.com/PLACEHOLDER/SecureRelayFL.git
+git clone https://github.com/sramharack/SecureRelayFL.git
 cd SecureRelayFL
 
 # create environment and install (pick one)
