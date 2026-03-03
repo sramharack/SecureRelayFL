@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "securerelay-fl"
@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10,<3.13"
 authors = [
-    {name = "Shankar", email = "placeholder@example.com"},
+    {name = "Shankar Ramharack", email = "sramharack@ieee.org"},
 ]
 keywords = [
     "federated-learning",
@@ -71,7 +71,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/PLACEHOLDER/SecureRelayFL"
+Repository = "https://github.com/sramharack/SecureRelayFL"
 
 # ---------- tool configs ----------
 
@@ -85,3 +85,6 @@ select = ["E", "F", "W", "I", "N", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.setuptools.packages.find]
+where = ["src"]
