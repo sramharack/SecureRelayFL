@@ -145,18 +145,17 @@ class RelayClient(fl.client.NumPyClient):
         return float(avg_loss), n_samples, metrics
 
 
-def client_fn(context) -> fl.client.Client:
-    """Factory function for Flower simulation. Reads config from context."""
-    cfg = context.run_config
-    facility_id = int(context.node_config["partition-id"])
-
-    return RelayClient(
-        facility_id=facility_id,
-        model_name=cfg.get("model", "cnn"),
-        data_dir=cfg.get("data_dir", "data/generated"),
-        local_epochs=int(cfg.get("local_epochs", 3)),
-        batch_size=int(cfg.get("batch_size", 64)),
-        lr=float(cfg.get("lr", 1e-3)),
-        device=cfg.get("device", "cpu"),
-        seed=int(cfg.get("seed", 42)),
-    ).to_client()
+def make_client_fn(model_name, data_dir, local_epochs, batch_size, lr, device, seed):
+    """Return a client_fn closure for Flower simulation."""
+    def client_fn(cid: str) -> fl.client.Client:
+        return RelayClient(
+            facility_id=int(cid),
+            model_name=model_name,
+            data_dir=data_dir,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            seed=seed,
+        ).to_client()
+    return client_fn

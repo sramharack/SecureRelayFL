@@ -23,7 +23,7 @@ import torch
 
 from securerelayfl.models.fault_classifier import FaultClassifier, MultiTaskLoss
 from securerelayfl.models.tcn_classifier import FaultClassifierTCN
-from securerelayfl.fl.client import client_fn
+from securerelayfl.fl.client import make_client_fn
 
 NUM_FACILITIES = 5
 
@@ -136,16 +136,16 @@ def run_simulation(args):
     # ---- Client resources ----
     client_resources = {"num_cpus": 1, "num_gpus": 0.0}
 
-    # ---- Run config passed to each client ----
-    run_config = {
-        "model": args.model,
-        "data_dir": args.data_dir,
-        "local_epochs": str(args.local_epochs),
-        "batch_size": str(args.batch_size),
-        "lr": str(args.lr),
-        "device": device,
-        "seed": str(args.seed),
-    }
+    # # ---- Run config passed to each client ----
+    # run_config = {
+    #     "model": args.model,
+    #     "data_dir": args.data_dir,
+    #     "local_epochs": str(args.local_epochs),
+    #     "batch_size": str(args.batch_size),
+    #     "lr": str(args.lr),
+    #     "device": device,
+    #     "seed": str(args.seed),
+    # }
 
     print(f"Starting FL simulation: {args.model.upper()}, "
           f"{args.rounds} rounds, {args.local_epochs} local epochs/round")
@@ -153,13 +153,22 @@ def run_simulation(args):
 
     t0 = time.time()
 
+    cfn = make_client_fn(
+        model_name=args.model,
+        data_dir=args.data_dir,
+        local_epochs=args.local_epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        device=device,
+        seed=args.seed,
+    )
+
     history = fl.simulation.start_simulation(
-        client_fn=client_fn,
+        client_fn=cfn,
         num_clients=NUM_FACILITIES,
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
         client_resources=client_resources,
-        actor_kwargs={"run_config": run_config},
         ray_init_args={"num_gpus": 0},
     )
 
