@@ -143,7 +143,75 @@ class RelayClient(fl.client.NumPyClient):
             "protection_action_acc": correct_pa / max(n_samples, 1),
         }
         return float(avg_loss), n_samples, metrics
+class FedProxClient(RelayClient):
+    """RelayClient with FedProx proximal term."""
 
+    def __init__(self, mu: float = 0.01, **kwargs):
+        super().__init__(**kwargs)
+        self.mu = mu
+
+    def fit(self, parameters, config):
+        self.set_parameters(parameters)
+        # Save global params for proximal term
+        global_params = [p.clone().detach() for p in self.model.parameters()]
+
+        local_epochs = config.get("local_epochs", self.local_epochs)
+        optimizer = optim.AdamW(
+            self.model.parameters(), lr=self.lr, weight_decay=1e-4,
+        )
+        self.model.train()
+
+        for _ in range(local_epochs):
+            for wf, ft, fz, pa in self.train_loader:
+                wf = wf.to(self.device)
+                ft = ft.to(self.device)
+                fz = fz.to(self.device)
+                pa = pa.to(self.device)
+
+                optimizer.zero_grad()
+                preds = self.model(wf)
+                loss, _ = self.criterion(preds, ft, fz, pa)
+
+                # Proximal term: (mu/2) * ||w - w_global||^2
+                prox = 0.0
+                for p, gp in zip(self.model.parameters(), global_params):
+                    prox += (p - gp).norm(2) ** 2
+                loss = loss + (self.mu / 2.0) * prox
+
+                loss.backward()
+                optimizer.step()
+
+        return self.get_parameters(config={}), self.n_train, {}
+
+
+def make_client_fn(model_name, data_dir, local_epochs, batch_size, lr, device, seed,
+                   fedprox_mu=None):
+    """Return a client_fn closure. If fedprox_mu is set, use FedProxClient."""
+    def client_fn(cid: str) -> fl.client.Client:
+        if fedprox_mu is not None and fedprox_mu > 0:
+            return FedProxClient(
+                mu=fedprox_mu,
+                facility_id=int(cid),
+                model_name=model_name,
+                data_dir=data_dir,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                device=device,
+                seed=seed,
+            ).to_client()
+        else:
+            return RelayClient(
+                facility_id=int(cid),
+                model_name=model_name,
+                data_dir=data_dir,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                device=device,
+                seed=seed,
+            ).to_client()
+    return client_fn
 
 def make_client_fn(model_name, data_dir, local_epochs, batch_size, lr, device, seed):
     """Return a client_fn closure for Flower simulation."""

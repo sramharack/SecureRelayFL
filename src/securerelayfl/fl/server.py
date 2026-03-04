@@ -164,8 +164,9 @@ def run_simulation(args):
         local_epochs=args.local_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        device="cpu",        # Ray workers can't see GPU
+        device="cpu",
         seed=args.seed,
+        fedprox_mu=args.fedprox_mu,
     )
 
     history = fl.simulation.start_simulation(
@@ -241,6 +242,8 @@ def run_simulation(args):
 
 def main():
     parser = argparse.ArgumentParser(description="SecureRelayFL FL Simulation")
+    parser.add_argument("--fedprox-mu", type=float, default=None,
+                        help="FedProx proximal term. None = standard FedAvg.")
     parser.add_argument("--model", type=str, default="cnn", choices=["cnn", "tcn"])
     parser.add_argument("--rounds", type=int, default=30,
                         help="Number of FL communication rounds")
