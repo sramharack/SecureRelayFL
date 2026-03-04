@@ -42,22 +42,22 @@ class FaultClassifier(nn.Module):
 
         self.backbone = nn.Sequential(
             nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
+            nn.GroupNorm(8, 32),       # was nn.BatchNorm1d(32)
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
 
             nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
+            nn.GroupNorm(8, 64),       # was nn.BatchNorm1d(64)
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
 
             nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(128),
+            nn.GroupNorm(8, 128),      # was nn.BatchNorm1d(128)
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
 
             nn.Conv1d(128, backbone_dim, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(backbone_dim),
+            nn.GroupNorm(8, backbone_dim),  # was nn.BatchNorm1d(backbone_dim)
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool1d(1),
         )

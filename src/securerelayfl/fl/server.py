@@ -75,6 +75,11 @@ def get_evaluate_fn(model_name: str, data_dir: str, device: str, seed: int):
     criterion = MultiTaskLoss().to(device)
 
     def evaluate(server_round: int, parameters, config):
+        print(f"[DEBUG] Round {server_round}, type(parameters)={type(parameters)}, "
+              f"len={len(parameters) if isinstance(parameters, list) else 'N/A'}")
+        if isinstance(parameters, list) and len(parameters) > 0:
+            print(f"[DEBUG] First param type={type(parameters[0])}, shape={parameters[0].shape if hasattr(parameters[0], 'shape') else 'no shape'}")
+
         # Load global parameters into model
         params_dict = zip(model.state_dict().keys(), parameters)
         state_dict = OrderedDict(
@@ -159,7 +164,7 @@ def run_simulation(args):
         local_epochs=args.local_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        device=device,
+        device="cpu",        # Ray workers can't see GPU
         seed=args.seed,
     )
 
