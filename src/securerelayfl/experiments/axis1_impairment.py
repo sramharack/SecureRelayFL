@@ -1,257 +1,285 @@
 """
-SecureRelayFL — Axis 1: Network Impairment Sweep
+SecureRelayFL — Axis 1: Network Impairment Sweep (v2)
 
-Runs FedAvg under varying network conditions:
-    - Packet loss: 0%, 5%, 10%, 15%, 25%
-    - Quantization: 32-bit, 16-bit, 8-bit
-    - Channel noise: 0, 0.001, 0.005, 0.01
+Runs FedAvg with ImpairedFedAvg strategy across a grid of:
+    - Packet loss:   [0%, 5%, 10%, 15%, 25%]
+    - Quantization:  [32-bit, 16-bit, 8-bit]
+    - Gaussian noise: [0, 0.001, 0.01]
+
+v2 changes:
+    - Uses cnn_v2 model by default (passes config_features)
+    - Impairment→scenario mapping for paper:
+        5%  loss → normal industrial EMI
+        10% loss → fault event network congestion
+        15% loss → cascading fault with switch buffer overflow
+        25% loss → partial network failure
+        8-bit quant → bandwidth-constrained WAN (1 Mbps satellite)
+        16-bit quant → shared corporate WAN (10 Mbps allocated)
 
 Usage:
     python -m securerelayfl.experiments.axis1_impairment --seed 42
-    python -m securerelayfl.experiments.axis1_impairment --rounds 50 --quick
 """
 
+from __future__ import annotations
+
 import argparse
+import itertools
 import json
-import os
 import time
-from collections import OrderedDict
-from itertools import product
+from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
+
 import flwr as fl
-from flwr.server import ServerConfig
+from flwr.common import ndarrays_to_parameters
+from flwr.server.strategy import FedAvg
 
-from securerelayfl.models.fault_classifier import FaultClassifier, MultiTaskLoss
-from securerelayfl.fl.client import make_client_fn
-from securerelayfl.fl.impaired_strategy import ImpairedFedAvg
-
-
-NUM_FACILITIES = 5
-
-
-def get_initial_parameters(model_name: str):
-    model = FaultClassifier()
-    ndarrays = [val.cpu().numpy() for _, val in model.state_dict().items()]
-    return fl.common.ndarrays_to_parameters(ndarrays)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from securerelayfl.fl.client import FaultClient, get_parameters
+from securerelayfl.fl.server import get_model, get_evaluate_fn
 
 
-def weighted_average(metrics):
-    total = sum(n for n, _ in metrics)
-    if total == 0:
-        return {}
-    result = {}
-    for key in ["fault_type_acc", "fault_zone_acc", "protection_action_acc"]:
-        result[key] = sum(n * m.get(key, 0.0) for n, m in metrics) / total
-    return result
+# Impairment grid
+PACKET_LOSS_RATES = [0.0, 0.05, 0.10, 0.15, 0.25]
+QUANT_BITS = [32, 16, 8]
+NOISE_SCALES = [0.0, 0.001, 0.01]
+
+# Scenario labels for paper
+SCENARIO_LABELS = {
+    0.0:  "Ideal (no loss)",
+    0.05: "Normal industrial EMI",
+    0.10: "Fault event congestion",
+    0.15: "Cascading fault / buffer overflow",
+    0.25: "Partial network failure",
+}
 
 
-def get_evaluate_fn(data_dir, device, seed):
-    from data.dataset import get_dataloaders
+def impair_parameters(
+    parameters: list[np.ndarray],
+    packet_loss: float,
+    quant_bits: int,
+    noise_scale: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Apply network impairments to model parameter arrays.
 
-    _, _, test_loader, _ = get_dataloaders(
-        data_dir=data_dir, facility_ids=None,
-        batch_size=64, val_split=0.15, test_split=0.15, seed=seed,
-    )
-    model = FaultClassifier().to(device)
-    criterion = MultiTaskLoss().to(device)
+    Simulates:
+        - Packet loss: randomly zero out fraction of parameter tensors
+        - Quantization: reduce precision to quant_bits
+        - Additive Gaussian noise: communication channel noise
+    """
+    impaired = []
+    for arr in parameters:
+        a = arr.copy()
 
-    def evaluate(server_round, parameters, config):
-        params_dict = zip(model.state_dict().keys(), parameters)
-        state_dict = OrderedDict(
-            {k: torch.tensor(v).to(device) for k, v in params_dict}
-        )
-        model.load_state_dict(state_dict, strict=True)
-        model.eval()
+        # Packet loss — simulate dropped gradient chunks
+        if packet_loss > 0:
+            mask = rng.random(a.shape) > packet_loss
+            a = a * mask
 
-        total_loss = 0.0
-        correct_ft, correct_fz, correct_pa = 0, 0, 0
-        n_samples = 0
+        # Quantization
+        if quant_bits < 32:
+            a_min, a_max = a.min(), a.max()
+            if a_max - a_min > 1e-10:
+                levels = 2 ** quant_bits - 1
+                a_norm = (a - a_min) / (a_max - a_min)
+                a_quant = np.round(a_norm * levels) / levels
+                a = a_quant * (a_max - a_min) + a_min
 
-        with torch.no_grad():
-            for wf, ft, fz, pa in test_loader:
-                wf, ft, fz, pa = (x.to(device) for x in (wf, ft, fz, pa))
-                preds = model(wf)
-                loss, _ = criterion(preds, ft, fz, pa)
-                bs = wf.size(0)
-                total_loss += loss.item() * bs
-                correct_ft += (preds["fault_type"].argmax(1) == ft).sum().item()
-                correct_fz += (preds["fault_zone"].argmax(1) == fz).sum().item()
-                correct_pa += (preds["protection_action"].argmax(1) == pa).sum().item()
-                n_samples += bs
+        # Gaussian noise
+        if noise_scale > 0:
+            a = a + rng.normal(0, noise_scale, a.shape).astype(a.dtype)
 
-        avg_loss = total_loss / max(n_samples, 1)
-        return float(avg_loss), {
-            "fault_type_acc": correct_ft / max(n_samples, 1),
-            "fault_zone_acc": correct_fz / max(n_samples, 1),
-            "protection_action_acc": correct_pa / max(n_samples, 1),
-        }
-
-    return evaluate
+        impaired.append(a)
+    return impaired
 
 
-def run_one_experiment(config, args, device):
+class ImpairedFedAvg(FedAvg):
+    """FedAvg with configurable network impairments applied to client updates."""
+
+    def __init__(
+        self,
+        packet_loss: float = 0.0,
+        quant_bits: int = 32,
+        noise_scale: float = 0.0,
+        seed: int = 42,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.packet_loss = packet_loss
+        self.quant_bits = quant_bits
+        self.noise_scale = noise_scale
+        self.rng = np.random.default_rng(seed)
+
+    def aggregate_fit(self, server_round, results, failures):
+        """Override to impair client parameters before aggregation."""
+        if not results:
+            return None, {}
+
+        # Apply impairments to each client's parameters
+        impaired_results = []
+        for client_proxy, fit_res in results:
+            params = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            impaired_params = impair_parameters(
+                params, self.packet_loss, self.quant_bits, self.noise_scale, self.rng
+            )
+            fit_res.parameters = fl.common.ndarrays_to_parameters(impaired_params)
+            impaired_results.append((client_proxy, fit_res))
+
+        return super().aggregate_fit(server_round, impaired_results, failures)
+
+
+def run_impairment_experiment(
+    packet_loss: float,
+    quant_bits: int,
+    noise_scale: float,
+    model_name: str,
+    data_dir: str,
+    rounds: int,
+    local_epochs: int,
+    batch_size: int,
+    lr: float,
+    seed: int,
+    output_dir: Path,
+) -> dict:
     """Run a single impairment configuration."""
-    label = config["label"]
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"  packet_loss={config['packet_loss']}, quant={config['quantize_bits']}bit, "
-          f"noise={config['noise_std']}")
-    print(f"{'='*60}")
+    device = torch.device("cpu")
+    n_clients = 5
+
+    tag = f"pl{packet_loss:.2f}_q{quant_bits}_n{noise_scale:.4f}"
+    exp_dir = output_dir / tag
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    init_model = get_model(model_name, device)
+    init_params = ndarrays_to_parameters(get_parameters(init_model))
 
     strategy = ImpairedFedAvg(
-        packet_loss_rate=config["packet_loss"],
-        quantize_bits=config["quantize_bits"],
-        noise_std=config["noise_std"],
-        seed=args.seed,
+        packet_loss=packet_loss,
+        quant_bits=quant_bits,
+        noise_scale=noise_scale,
+        seed=seed,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
-        min_fit_clients=NUM_FACILITIES,
-        min_evaluate_clients=NUM_FACILITIES,
-        min_available_clients=NUM_FACILITIES,
-        initial_parameters=get_initial_parameters("cnn"),
-        evaluate_metrics_aggregation_fn=weighted_average,
-        evaluate_fn=get_evaluate_fn(args.data_dir, device, args.seed),
-        on_fit_config_fn=lambda r: {"local_epochs": args.local_epochs},
+        min_fit_clients=n_clients,
+        min_evaluate_clients=n_clients,
+        min_available_clients=n_clients,
+        initial_parameters=init_params,
+        evaluate_fn=get_evaluate_fn(model_name, data_dir, device, exp_dir),
     )
 
-    cfn = make_client_fn(
-        model_name="cnn",
-        data_dir=args.data_dir,
-        local_epochs=args.local_epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device="cpu",
-        seed=args.seed,
+    client_fn_partial = partial(
+        lambda cid, **kw: FaultClient(facility_id=int(cid), **kw),
+        model_name=model_name,
+        data_dir=data_dir,
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        lr=lr,
+        fedprox_mu=0.0,
+        device=device,
     )
 
     t0 = time.time()
-    history = fl.simulation.start_simulation(
-        client_fn=cfn,
-        num_clients=NUM_FACILITIES,
-        config=ServerConfig(num_rounds=args.rounds),
+    fl.simulation.start_simulation(
+        client_fn=client_fn_partial,
+        num_clients=n_clients,
+        config=fl.server.ServerConfig(num_rounds=rounds),
         strategy=strategy,
+        ray_init_args={"num_gpus": 0},
         client_resources={"num_cpus": 1, "num_gpus": 0.0},
-        ray_init_args={"num_gpus": 0, "include_dashboard": False},
     )
     elapsed = time.time() - t0
 
-    # Extract final and best metrics
-    cm = []
-    if history.metrics_centralized:
-        rounds_seen = set()
-        for key, values in history.metrics_centralized.items():
-            for r, val in values:
-                if r not in rounds_seen:
-                    rounds_seen.add(r)
-                    cm.append({"round": r})
-                entry = next(e for e in cm if e["round"] == r)
-                entry[key] = val
-
-    best_pa = max(cm, key=lambda x: x.get("protection_action_acc", 0)) if cm else {}
-    final = cm[-1] if cm else {}
+    # Load final round metrics
+    metrics_path = exp_dir / "round_metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path) as f:
+            round_metrics = json.load(f)
+        final = round_metrics[-1] if round_metrics else {}
+    else:
+        final = {}
 
     result = {
-        "config": config,
-        "training_time_s": elapsed,
-        "best_round": best_pa,
-        "final_round": final,
-        "impairment_log": strategy.impairment_log,
-        "all_rounds": cm,
+        "packet_loss": packet_loss,
+        "quant_bits": quant_bits,
+        "noise_scale": noise_scale,
+        "scenario": SCENARIO_LABELS.get(packet_loss, ""),
+        "elapsed_s": elapsed,
+        **{k: v for k, v in final.items() if k != "round"},
     }
 
-    print(f"  Time: {elapsed:.0f}s")
-    if final:
-        print(f"  Final: FT={final.get('fault_type_acc',0):.3f} "
-              f"FZ={final.get('fault_zone_acc',0):.3f} "
-              f"PA={final.get('protection_action_acc',0):.3f}")
-    if best_pa:
-        print(f"  Best PA: round {best_pa.get('round','?')} "
-              f"FT={best_pa.get('fault_type_acc',0):.3f} "
-              f"PA={best_pa.get('protection_action_acc',0):.3f}")
+    with open(exp_dir / "summary.json", "w") as f:
+        json.dump(result, f, indent=2)
 
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Axis 1: Network Impairment Sweep")
+    parser = argparse.ArgumentParser(description="Axis 1: Impairment sweep")
+    parser.add_argument("--model", type=str, default="cnn_v2", choices=["cnn_v1", "cnn_v2"])
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--data-dir", type=str, default="data/generated")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--data-dir", type=str, default="data/generated")
     parser.add_argument("--output-dir", type=str, default="results/axis1_impairment")
     parser.add_argument("--quick", action="store_true",
-                        help="Run reduced sweep for testing")
+                        help="Run reduced grid for quick testing")
     args = parser.parse_args()
-
-    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu"
-    os.makedirs(args.output_dir, exist_ok=True)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # ---- Define experiment grid ----
-    if args.quick:
-        configs = [
-            {"label": "ideal", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.0},
-            {"label": "loss_10pct", "packet_loss": 0.10, "quantize_bits": None, "noise_std": 0.0},
-            {"label": "quant_8bit", "packet_loss": 0.0, "quantize_bits": 8, "noise_std": 0.0},
-            {"label": "noise_0.01", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.01},
-        ]
-    else:
-        configs = [
-            # Baseline
-            {"label": "ideal", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.0},
-            # Packet loss sweep
-            {"label": "loss_5pct", "packet_loss": 0.05, "quantize_bits": None, "noise_std": 0.0},
-            {"label": "loss_10pct", "packet_loss": 0.10, "quantize_bits": None, "noise_std": 0.0},
-            {"label": "loss_15pct", "packet_loss": 0.15, "quantize_bits": None, "noise_std": 0.0},
-            {"label": "loss_25pct", "packet_loss": 0.25, "quantize_bits": None, "noise_std": 0.0},
-            # Quantization sweep (bandwidth constraint)
-            {"label": "quant_16bit", "packet_loss": 0.0, "quantize_bits": 16, "noise_std": 0.0},
-            {"label": "quant_8bit", "packet_loss": 0.0, "quantize_bits": 8, "noise_std": 0.0},
-            # Channel noise sweep
-            {"label": "noise_0.001", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.001},
-            {"label": "noise_0.005", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.005},
-            {"label": "noise_0.01", "packet_loss": 0.0, "quantize_bits": None, "noise_std": 0.01},
-            # Combined worst-case
-            {"label": "combined_moderate", "packet_loss": 0.05, "quantize_bits": 16, "noise_std": 0.001},
-            {"label": "combined_severe", "packet_loss": 0.15, "quantize_bits": 8, "noise_std": 0.005},
-        ]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Running {len(configs)} impairment configurations")
-    print(f"Rounds: {args.rounds}, Local epochs: {args.local_epochs}, LR: {args.lr}")
-    print(f"Device: {device}")
+    # Grid
+    if args.quick:
+        grid = [(0.0, 32, 0.0), (0.10, 32, 0.0), (0.0, 8, 0.0)]
+    else:
+        # Full grid: packet loss × quant_bits (noise fixed at 0 for main sweep)
+        # Plus noise sub-sweep at default settings
+        grid = []
+        for pl in PACKET_LOSS_RATES:
+            for qb in QUANT_BITS:
+                grid.append((pl, qb, 0.0))
+        # Noise sub-sweep (ideal loss, 32-bit)
+        for ns in NOISE_SCALES:
+            if ns > 0:
+                grid.append((0.0, 32, ns))
+
+    print(f"Axis 1 — Impairment Sweep: {len(grid)} configurations")
+    print(f"Model: {args.model} | Rounds: {args.rounds}\n")
 
     all_results = []
-    for config in configs:
-        result = run_one_experiment(config, args, device)
+    for i, (pl, qb, ns) in enumerate(grid):
+        scenario = SCENARIO_LABELS.get(pl, "")
+        print(f"[{i+1}/{len(grid)}] PL={pl:.0%} Q={qb}bit N={ns:.4f} — {scenario}")
+
+        result = run_impairment_experiment(
+            packet_loss=pl,
+            quant_bits=qb,
+            noise_scale=ns,
+            model_name=args.model,
+            data_dir=args.data_dir,
+            rounds=args.rounds,
+            local_epochs=args.local_epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            output_dir=output_dir,
+        )
         all_results.append(result)
+        print(f"  → PA={result.get('acc_pa', 'N/A'):.3f}  FT={result.get('acc_ft', 'N/A'):.3f}\n")
 
-        # Save incrementally
-        with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-            json.dump(all_results, f, indent=2, default=str)
+    # Save consolidated results
+    with open(output_dir / "all_results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
 
-    # ---- Print summary table ----
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    print(f"{'Config':<25} {'Best FT':>8} {'Best FZ':>8} {'Best PA':>8} {'Final PA':>8}")
-    print("-" * 60)
-    for r in all_results:
-        bp = r["best_round"]
-        fp = r["final_round"]
-        print(f"{r['config']['label']:<25} "
-              f"{bp.get('fault_type_acc',0):>8.3f} "
-              f"{bp.get('fault_zone_acc',0):>8.3f} "
-              f"{bp.get('protection_action_acc',0):>8.3f} "
-              f"{fp.get('protection_action_acc',0):>8.3f}")
-
-    print(f"\nAll results saved to {args.output_dir}/results.json")
+    print(f"Done. Results saved to {output_dir}")
 
 
 if __name__ == "__main__":

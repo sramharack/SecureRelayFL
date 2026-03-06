@@ -1,632 +1,489 @@
+#!/usr/bin/env python3
 """
-SecureRelayFL - Synthetic Fault Waveform Generator
-===================================================
+SecureRelayFL — Synthetic Fault Waveform Generator (v2)
 
-Generates physics-based fault current and voltage waveforms for 5 industrial
-facility profiles. Each facility has distinct electrical characteristics that
-create naturally non-IID data distributions for federated learning experiments.
+v2 changes:
+    - Each facility now has 2-3 operating configurations (tie open/closed, DG on/off, etc.)
+    - Configuration sampled per waveform based on probability weights
+    - Protection action assignment is now configuration-aware
+    - Outputs config_id.npy (N,) int64 and config_features.npy (N,3) float32
 
-Waveform model:
-    Pre-fault:  v(t) = V_peak * sin(ωt + φ_v)
-                i(t) = I_peak * sin(ωt + φ_i)
+Physics references:
+    - Asymmetrical fault current:         IEEE 551-2006, IEC 60909
+    - Grounding-dependent sag/swell:      IEEE C62.92
+    - High-impedance arcing faults:       IEEE PSRC WG D15
 
-    Post-fault: i(t) = I_f_peak * [sin(ωt + φ_f) - sin(φ_f) * exp(-t/τ)] + noise
-                v(t) = V_sag * sin(ωt + φ_v) + harmonics + noise
-
-    where τ = L/R = (X/R) / ω  (DC offset decay time constant)
-
-Fault types:
-    0 - No fault (normal operation / motor starting / load switching)
-    1 - Single line-to-ground (SLG)
-    2 - Line-to-line (LL)
-    3 - High-impedance arcing fault (HIF)
-
-Protection actions:
-    0 - No action
-    1 - Trip instantaneous
-    2 - Trip with time delay
-    3 - ZSI block (send restraint signal)
-    4 - Alarm only (HIF on HRG system)
+Usage:
+    python data/generator/generate.py --n-samples 1000 --seed 42
 """
+
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+from pathlib import Path
 
 import numpy as np
-import pandas as pd
-from dataclasses import dataclass, field
-from typing import Optional
-import os
-import json
 
+# ──────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────
+FREQ_HZ = 60
+SAMPLE_RATE = 15_360          # 256 samples / cycle
+CYCLES_PRE = 3
+CYCLES_POST = 7
+TOTAL_CYCLES = CYCLES_PRE + CYCLES_POST
+N_SAMPLES_PER_WAVEFORM = TOTAL_CYCLES * (SAMPLE_RATE // FREQ_HZ)  # 2560
+N_CHANNELS = 6                # Va Vb Vc Ia Ib Ic
+FAULT_INCEPTION_SAMPLE = CYCLES_PRE * (SAMPLE_RATE // FREQ_HZ)    # 768
 
-# ============================================================================
-# Facility Profiles
-# ============================================================================
-
-@dataclass
-class FacilityProfile:
-    """Electrical characteristics defining a facility."""
-    name: str
-    voltage_kv: float
-    fault_mva: float
-    xr_ratio: float
-    grounding: str              # "solid", "low_r", "high_r", "ungrounded", "resistance"
-    noise_snr_db: float         # Signal-to-noise ratio
-    ct_saturation_prob: float   # Probability of CT saturation per sample
-    harmonic_distortion: float  # THD as fraction (0.0 - 0.3)
-    fault_type_dist: dict       # {fault_type: probability}
-    description: str = ""
-
-
-FACILITY_PROFILES = {
-    0: FacilityProfile(
-        name="Data Center",
-        voltage_kv=13.8,
-        fault_mva=250,
-        xr_ratio=8,
-        grounding="solid",
-        noise_snr_db=40,
-        ct_saturation_prob=0.05,
-        harmonic_distortion=0.03,
-        fault_type_dist={0: 0.25, 1: 0.45, 2: 0.15, 3: 0.15},
-        description="Main-tie-main bus, UPS loads, clean waveforms"
-    ),
-    1: FacilityProfile(
-        name="Steel Plant",
-        voltage_kv=34.5,
-        fault_mva=500,
-        xr_ratio=15,
-        grounding="low_r",
-        noise_snr_db=25,
-        ct_saturation_prob=0.25,
-        harmonic_distortion=0.15,
-        fault_type_dist={0: 0.20, 1: 0.30, 2: 0.35, 3: 0.15},
-        description="Arc furnace, large motors, high fault current, CT saturation"
-    ),
-    2: FacilityProfile(
-        name="Petrochemical",
-        voltage_kv=13.8,
-        fault_mva=150,
-        xr_ratio=6,
-        grounding="high_r",
-        noise_snr_db=35,
-        ct_saturation_prob=0.10,
-        harmonic_distortion=0.05,
-        fault_type_dist={0: 0.20, 1: 0.35, 2: 0.15, 3: 0.30},
-        description="Induction motors, VFDs, HRG system, high-impedance faults"
-    ),
-    3: FacilityProfile(
-        name="Pharmaceutical",
-        voltage_kv=4.16,
-        fault_mva=100,
-        xr_ratio=5,
-        grounding="resistance",
-        noise_snr_db=38,
-        ct_saturation_prob=0.08,
-        harmonic_distortion=0.08,
-        fault_type_dist={0: 0.25, 1: 0.40, 2: 0.20, 3: 0.15},
-        description="Clean room loads, sensitive equipment, moderate fault level"
-    ),
-    4: FacilityProfile(
-        name="Cement Plant",
-        voltage_kv=34.5,
-        fault_mva=400,
-        xr_ratio=12,
-        grounding="low_r",
-        noise_snr_db=28,
-        ct_saturation_prob=0.20,
-        harmonic_distortion=0.12,
-        fault_type_dist={0: 0.20, 1: 0.30, 2: 0.30, 3: 0.20},
-        description="Large mill motors, high inertia loads, dusty environment"
-    ),
+FAULT_TYPES = {0: "no_fault", 1: "SLG", 2: "LL", 3: "HIF"}
+FAULT_ZONES = {0: "bus", 1: "near", 2: "far", 3: "none"}
+PROTECTION_ACTIONS = {
+    0: "no_action",
+    1: "trip_instantaneous",
+    2: "trip_delayed",
+    3: "ZSI_block",
+    4: "alarm_only",
 }
 
+# ──────────────────────────────────────────────────────────────────
+# Facility Profiles (v2 — with operating configurations)
+# ──────────────────────────────────────────────────────────────────
+FACILITY_PROFILES = {
+    0: {
+        "name": "Data Center",
+        "voltage_kv": 13.8,
+        "grounding": "solidly_grounded",
+        "snr_db": 40,
+        "fault_type_weights": [0.10, 0.35, 0.35, 0.20],
+        "fault_zone_weights": [0.25, 0.40, 0.35],
+        "configs": [
+            {   # Config 0: Normal — both mains closed, tie closed
+                "id": 0, "name": "both_mains_tie_closed",
+                "fault_mva": 250, "xr_ratio": 8,
+                "source_count": 2,
+                "probability": 0.5,
+            },
+            {   # Config 1: One main open, tie open (maintenance)
+                "id": 1, "name": "single_main_tie_open",
+                "fault_mva": 125, "xr_ratio": 6,
+                "source_count": 1,
+                "probability": 0.3,
+            },
+            {   # Config 2: Both mains, tie open, DG online
+                "id": 2, "name": "both_mains_dg_online",
+                "fault_mva": 300, "xr_ratio": 10,
+                "source_count": 3,
+                "probability": 0.2,
+            },
+        ],
+    },
+    1: {
+        "name": "Steel Plant",
+        "voltage_kv": 34.5,
+        "grounding": "low_r_grounded",
+        "snr_db": 25,
+        "fault_type_weights": [0.08, 0.30, 0.42, 0.20],
+        "fault_zone_weights": [0.20, 0.45, 0.35],
+        "configs": [
+            {"id": 0, "name": "arc_furnace_on", "fault_mva": 500, "xr_ratio": 15,
+             "source_count": 2, "probability": 0.4},
+            {"id": 1, "name": "arc_furnace_off", "fault_mva": 350, "xr_ratio": 12,
+             "source_count": 1, "probability": 0.3},
+            {"id": 2, "name": "bus_coupler_open", "fault_mva": 250, "xr_ratio": 10,
+             "source_count": 1, "probability": 0.3},
+        ],
+    },
+    2: {
+        "name": "Petrochemical",
+        "voltage_kv": 13.8,
+        "grounding": "high_r_grounded",
+        "snr_db": 35,
+        "fault_type_weights": [0.10, 0.25, 0.30, 0.35],
+        "fault_zone_weights": [0.20, 0.35, 0.45],
+        "configs": [
+            {"id": 0, "name": "normal_dual_incomer", "fault_mva": 150, "xr_ratio": 5,
+             "source_count": 2, "probability": 0.5},
+            {"id": 1, "name": "single_incomer_transfer", "fault_mva": 80, "xr_ratio": 4,
+             "source_count": 1, "probability": 0.3},
+            {"id": 2, "name": "emergency_gen_island", "fault_mva": 60, "xr_ratio": 3,
+             "source_count": 1, "probability": 0.2},
+        ],
+    },
+    3: {
+        "name": "Pharmaceutical",
+        "voltage_kv": 4.16,
+        "grounding": "resistance_grounded",
+        "snr_db": 38,
+        "fault_type_weights": [0.12, 0.35, 0.33, 0.20],
+        "fault_zone_weights": [0.25, 0.40, 0.35],
+        "configs": [
+            {"id": 0, "name": "normal_ups_online", "fault_mva": 200, "xr_ratio": 10,
+             "source_count": 2, "probability": 0.5},
+            {"id": 1, "name": "ups_bypass", "fault_mva": 220, "xr_ratio": 8,
+             "source_count": 2, "probability": 0.3},
+            {"id": 2, "name": "single_source_maintenance", "fault_mva": 100, "xr_ratio": 7,
+             "source_count": 1, "probability": 0.2},
+        ],
+    },
+    4: {
+        "name": "Cement Plant",
+        "voltage_kv": 34.5,
+        "grounding": "low_r_grounded",
+        "snr_db": 28,
+        "fault_type_weights": [0.10, 0.30, 0.40, 0.20],
+        "fault_zone_weights": [0.25, 0.40, 0.35],
+        "configs": [
+            {"id": 0, "name": "full_production", "fault_mva": 400, "xr_ratio": 12,
+             "source_count": 2, "probability": 0.4},
+            {"id": 1, "name": "kiln_only", "fault_mva": 300, "xr_ratio": 10,
+             "source_count": 2, "probability": 0.3},
+            {"id": 2, "name": "single_transformer", "fault_mva": 200, "xr_ratio": 8,
+             "source_count": 1, "probability": 0.3},
+        ],
+    },
+}
 
-# ============================================================================
+# ──────────────────────────────────────────────────────────────────
 # Waveform Physics
-# ============================================================================
+# ──────────────────────────────────────────────────────────────────
 
-FREQ_HZ = 60
-OMEGA = 2 * np.pi * FREQ_HZ
-SAMPLES_PER_CYCLE = 256
-CYCLES_PREFAULT = 3
-CYCLES_POSTFAULT = 7
-TOTAL_CYCLES = CYCLES_PREFAULT + CYCLES_POSTFAULT
-TOTAL_SAMPLES = TOTAL_CYCLES * SAMPLES_PER_CYCLE
-SAMPLE_RATE = FREQ_HZ * SAMPLES_PER_CYCLE  # 15360 Hz
-DT = 1.0 / SAMPLE_RATE
-
-# Fault onset sample index
-FAULT_ONSET = CYCLES_PREFAULT * SAMPLES_PER_CYCLE
+def _time_array() -> np.ndarray:
+    """Return time vector for one waveform window."""
+    return np.arange(N_SAMPLES_PER_WAVEFORM) / SAMPLE_RATE
 
 
-def _time_array():
-    """Generate time array for the full waveform window."""
-    return np.arange(TOTAL_SAMPLES) * DT
+def _three_phase_prefault(
+    t: np.ndarray,
+    v_peak: float,
+    i_peak: float,
+    phi_v: float = 0.0,
+    phi_i_lag: float = 0.52,   # ~30° load angle
+) -> np.ndarray:
+    """Generate balanced 3-phase pre-fault V & I.  Shape: (6, len(t))."""
+    omega = 2 * math.pi * FREQ_HZ
+    phases = [0.0, -2 * math.pi / 3, 2 * math.pi / 3]
+    wf = np.zeros((6, len(t)), dtype=np.float32)
+    for k, ph in enumerate(phases):
+        wf[k] = v_peak * np.sin(omega * t + phi_v + ph)
+        wf[k + 3] = i_peak * np.sin(omega * t + phi_v + ph - phi_i_lag)
+    return wf
 
 
-def _add_noise(signal: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
-    """Add Gaussian white noise at specified SNR."""
-    signal_power = np.mean(signal ** 2)
-    noise_power = signal_power / (10 ** (snr_db / 10))
-    noise = rng.normal(0, np.sqrt(noise_power), len(signal))
-    return signal + noise
+def _apply_fault_slg(
+    wf: np.ndarray,
+    t: np.ndarray,
+    inception: int,
+    fault_mva: float,
+    xr_ratio: float,
+    v_peak: float,
+    grounding: str,
+) -> np.ndarray:
+    """Single-line-to-ground fault on phase A (IEEE 551 / IEC 60909)."""
+    omega = 2 * math.pi * FREQ_HZ
+    z_mag = (v_peak / 1e3) / (fault_mva + 1e-6) * 1e3  # simplified impedance
+    tau_dc = xr_ratio / (2 * math.pi * FREQ_HZ)         # DC offset time constant
+
+    i_fault_peak = v_peak / (z_mag + 1e-6)
+    t_fault = t[inception:] - t[inception]
+
+    # Asymmetric fault current on phase A  (IEEE 551-2006 eq. 1)
+    i_ac = i_fault_peak * np.sin(omega * t_fault)
+    i_dc = i_fault_peak * np.exp(-t_fault / (tau_dc + 1e-9))
+    wf[3, inception:] = i_ac + i_dc   # Ia
+
+    # Voltage sag on faulted phase (IEEE C62.92)
+    sag = 0.15 if grounding == "solidly_grounded" else 0.35
+    if grounding == "high_r_grounded":
+        sag = 0.70  # limited fault current → less sag
+    wf[0, inception:] *= sag
+
+    # Swell on unfaulted phases
+    swell = 1.0 + (1.0 - sag) * 0.3
+    wf[1, inception:] *= swell
+    wf[2, inception:] *= swell
+
+    return wf
 
 
-def _add_harmonics(signal: np.ndarray, t: np.ndarray, thd: float,
-                   rng: np.random.Generator) -> np.ndarray:
-    """Add harmonic distortion (3rd, 5th, 7th, 11th, 13th)."""
-    if thd < 0.001:
-        return signal
-    harmonics = [3, 5, 7, 11, 13]
-    # Distribute THD across harmonics with decreasing amplitude
-    weights = np.array([0.40, 0.25, 0.15, 0.12, 0.08])
-    fund_amplitude = np.max(np.abs(signal)) if np.max(np.abs(signal)) > 0 else 1.0
-    for h, w in zip(harmonics, weights):
-        h_amp = fund_amplitude * thd * w
-        h_phase = rng.uniform(0, 2 * np.pi)
-        signal = signal + h_amp * np.sin(h * OMEGA * t + h_phase)
-    return signal
+def _apply_fault_ll(
+    wf: np.ndarray,
+    t: np.ndarray,
+    inception: int,
+    fault_mva: float,
+    xr_ratio: float,
+    v_peak: float,
+) -> np.ndarray:
+    """Line-to-line fault between phases A and B."""
+    omega = 2 * math.pi * FREQ_HZ
+    z_mag = (v_peak / 1e3) / (fault_mva + 1e-6) * 1e3
+    tau_dc = xr_ratio / (2 * math.pi * FREQ_HZ)
+
+    i_fault_peak = (v_peak * math.sqrt(3)) / (2 * z_mag + 1e-6)
+    t_fault = t[inception:] - t[inception]
+
+    i_ac = i_fault_peak * np.sin(omega * t_fault + math.pi / 6)
+    i_dc = i_fault_peak * 0.8 * np.exp(-t_fault / (tau_dc + 1e-9))
+
+    wf[3, inception:] = i_ac + i_dc       # Ia
+    wf[4, inception:] = -(i_ac + i_dc)    # Ib = -Ia for LL fault
+
+    # Voltage depression on both faulted phases
+    wf[0, inception:] *= 0.5
+    wf[1, inception:] *= 0.5
+
+    return wf
 
 
-def _ct_saturation(signal: np.ndarray, severity: float) -> np.ndarray:
-    """Simulate CT saturation by clipping and distorting peaks."""
-    clip_level = np.max(np.abs(signal)) * (1.0 - 0.5 * severity)
-    saturated = np.clip(signal, -clip_level, clip_level)
-    # Add mild exponential rounding near saturation
-    mask = np.abs(saturated) > 0.8 * clip_level
-    saturated[mask] = np.sign(saturated[mask]) * clip_level * (
-        1 - 0.1 * np.exp(-3 * (np.abs(saturated[mask]) / clip_level))
-    )
-    return saturated
-
-
-def _arcing_fault_current(t_fault: np.ndarray, i_peak: float, omega: float,
-                          rng: np.random.Generator) -> np.ndarray:
-    """
-    Generate high-impedance arcing fault current with realistic characteristics.
-
-    Based on IEEE PSRC WG D15 report and Emanuel two-diode model:
-    - Intermittent arc extinction and restrike (random envelope)
-    - Asymmetry between positive and negative half-cycles (different Rp, Rn)
-    - Strong low-order harmonics (2nd, 3rd dominant) per PSRC findings
-    - Fault currents typically 0-75A with very erratic waveforms
-    """
-    phi_arc = rng.uniform(0, 2 * np.pi)
-    base = i_peak * np.sin(omega * t_fault + phi_arc)
-
-    # Asymmetry between positive and negative half-cycles (Emanuel model)
-    # Different effective resistance in each half-cycle
-    asym_ratio = rng.uniform(0.6, 0.9)  # Rn/Rp ratio
-    negative_mask = base < 0
-    base[negative_mask] *= asym_ratio
-
-    # Random arc extinction and restrike envelope
-    arc_envelope = np.ones_like(t_fault)
-    n_samples = len(t_fault)
-    n_extinctions = rng.integers(3, 12)
-    for _ in range(n_extinctions):
-        start = rng.integers(0, max(1, n_samples - 50))
-        duration = rng.integers(10, 80)
-        end = min(start + duration, n_samples)
-        arc_envelope[start:end] *= rng.uniform(0.0, 0.3)
-
-    # Explicit low-order harmonics (PSRC D15: 2nd-7th strongly present in HIF)
-    # 3rd harmonic has unique phase relationship to faulted phase voltage
-    h3 = 0.20 * i_peak * np.sin(3 * omega * t_fault + phi_arc + rng.uniform(-0.3, 0.3))
-    # 2nd harmonic (indicator of asymmetry / nonlinearity)
-    h2 = 0.15 * i_peak * np.sin(2 * omega * t_fault + rng.uniform(0, np.pi))
-    # 5th harmonic
-    h5 = 0.08 * i_peak * np.sin(5 * omega * t_fault + rng.uniform(0, 2 * np.pi))
-
-    return base * arc_envelope + h3 * arc_envelope + h2 * arc_envelope + h5 * arc_envelope
-
-
-# ============================================================================
-# Main Generator
-# ============================================================================
-
-def generate_single_sample(
-    facility: FacilityProfile,
-    fault_type: int,
+def _apply_fault_hif(
+    wf: np.ndarray,
+    t: np.ndarray,
+    inception: int,
+    v_peak: float,
     rng: np.random.Generator,
-    fault_location: Optional[float] = None,  # 0.0 = bus, 1.0 = end of feeder
-) -> dict:
-    """
-    Generate a single 3-phase fault waveform sample.
+) -> np.ndarray:
+    """High-impedance arcing fault (IEEE PSRC WG D15 model)."""
+    omega = 2 * math.pi * FREQ_HZ
+    t_fault = t[inception:] - t[inception]
 
-    Returns dict with:
-        - 'va', 'vb', 'vc': voltage waveforms (TOTAL_SAMPLES,)
-        - 'ia', 'ib', 'ic': current waveforms (TOTAL_SAMPLES,)
-        - 'fault_type': int (0-3)
-        - 'fault_zone': int (0=bus, 1=near, 2=far)
-        - 'protection_action': int (0-4)
-        - 'facility_id': int
-        - 'metadata': dict with generation parameters
+    # Low-magnitude arcing current with randomized re-ignition
+    i_arc_peak = v_peak * 0.005 * (1 + 0.3 * rng.standard_normal())
+    i_arc = i_arc_peak * np.sin(omega * t_fault)
+
+    # Arc re-ignition noise bursts (PSRC D15 characteristic)
+    for _ in range(rng.integers(3, 8)):
+        burst_start = rng.integers(0, max(len(t_fault) - 50, 1))
+        burst_len = rng.integers(20, 60)
+        burst_end = min(burst_start + burst_len, len(t_fault))
+        i_arc[burst_start:burst_end] += i_arc_peak * 0.5 * rng.standard_normal(
+            burst_end - burst_start
+        )
+
+    # Mild voltage distortion
+    wf[0, inception:] *= 0.97 + 0.03 * rng.standard_normal(len(t_fault))
+    wf[3, inception:] += i_arc
+
+    return wf
+
+
+def _apply_zone_attenuation(wf: np.ndarray, inception: int, zone: int) -> np.ndarray:
+    """Apply impedance attenuation based on fault zone (distance from relay)."""
+    # zone 0=bus (closest), 1=near, 2=far
+    atten = {0: 1.0, 1: 0.65, 2: 0.35}
+    factor = atten.get(zone, 1.0)
+    # Attenuate post-fault current channels only
+    for ch in [3, 4, 5]:
+        delta = wf[ch, inception:] - wf[ch, inception - 1]
+        wf[ch, inception:] = wf[ch, inception - 1] + delta * factor
+    return wf
+
+
+def _add_noise(wf: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
+    """Add Gaussian noise at the specified SNR."""
+    sig_power = np.mean(wf ** 2, axis=1, keepdims=True) + 1e-12
+    noise_power = sig_power / (10 ** (snr_db / 10))
+    noise = rng.standard_normal(wf.shape).astype(np.float32) * np.sqrt(noise_power)
+    return wf + noise
+
+
+# ──────────────────────────────────────────────────────────────────
+# Configuration-Aware Protection Action (v2)
+# ──────────────────────────────────────────────────────────────────
+
+def _assign_protection_action(
+    fault_type: int, fault_zone: int, config: dict, grounding: str
+) -> int:
+    """Configuration-aware protection action assignment.
+
+    The key v2 insight: with multiple source contributions, coordination
+    (ZSI blocking, delayed trip) is needed. With single-source configs,
+    simpler instantaneous tripping suffices.
+    """
+    source_count = config["source_count"]
+
+    if fault_type == 0:   # no fault
+        return 0          # no_action
+
+    if fault_type == 3:   # HIF — arcing, low magnitude
+        # HRG systems can't reliably trip on ground fault current
+        return 4          # alarm_only
+
+    # SLG (1) and LL (2) faults
+    if fault_zone == 0:   # bus fault
+        if source_count >= 2:
+            return 3      # ZSI_block (coordinate multiple sources)
+        else:
+            return 1      # trip_instantaneous (single source)
+
+    elif fault_zone == 1: # near fault
+        if source_count >= 2:
+            return 2      # trip_delayed (coordinated downstream)
+        else:
+            return 1      # trip_instantaneous
+
+    elif fault_zone == 2: # far fault
+        return 2          # trip_delayed (wait for downstream to clear)
+
+    return 0  # fallback
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-Sample Generation
+# ──────────────────────────────────────────────────────────────────
+
+def _generate_sample(
+    profile: dict, rng: np.random.Generator
+) -> tuple[np.ndarray, int, int, int, int, np.ndarray]:
+    """Generate one fault waveform sample.
+
+    Returns:
+        waveform   (6, 2560) float32
+        fault_type  int
+        fault_zone  int
+        prot_action int
+        config_id   int
+        config_feat (3,) float32  — [fault_mva_norm, xr_ratio_norm, source_count_norm]
     """
     t = _time_array()
-    t_fault = t[FAULT_ONSET:] - t[FAULT_ONSET]  # Time relative to fault onset
+    v_kv = profile["voltage_kv"]
+    v_peak = v_kv * 1e3 * math.sqrt(2) / math.sqrt(3)  # phase peak voltage
+    grounding = profile["grounding"]
 
-    # Base system parameters
-    v_base = facility.voltage_kv * 1000 * np.sqrt(2) / np.sqrt(3)  # Phase peak voltage
-    z_base = (facility.voltage_kv ** 2) / facility.fault_mva  # Ohms
-    i_base = (facility.fault_mva * 1e6) / (np.sqrt(3) * facility.voltage_kv * 1e3)
-    i_peak_base = i_base * np.sqrt(2)
+    # --- Sample operating configuration ---
+    configs = profile["configs"]
+    probs = np.array([c["probability"] for c in configs], dtype=np.float64)
+    probs /= probs.sum()  # safety normalize
+    cfg_idx = rng.choice(len(configs), p=probs)
+    cfg = configs[cfg_idx]
 
-    # Random pre-fault load (0.3 - 0.9 pu)
-    load_pu = rng.uniform(0.3, 0.9)
-    pf_angle = rng.uniform(0.15, 0.45)  # Power factor angle (radians)
+    fault_mva = cfg["fault_mva"]
+    xr_ratio = cfg["xr_ratio"]
 
-    # Fault location affects impedance seen
-    if fault_location is None:
-        fault_location = rng.uniform(0.0, 1.0)
+    # Nominal load current (proportional to fault MVA for realism)
+    i_peak = (fault_mva / (v_kv * math.sqrt(3))) * 1e3 * 0.05  # ~5% of fault current
 
-    # Impedance to fault (affects fault current magnitude)
-    z_fault_pu = 0.05 + fault_location * 0.4  # 0.05 to 0.45 pu
-    tau = facility.xr_ratio / OMEGA  # DC offset time constant
+    # --- Sample fault type ---
+    ft_weights = np.array(profile["fault_type_weights"], dtype=np.float64)
+    ft_weights /= ft_weights.sum()
+    fault_type = int(rng.choice(4, p=ft_weights))
 
-    # Phase angles (120° apart)
-    phase_offsets = np.array([0, -2 * np.pi / 3, 2 * np.pi / 3])
-    phi_v = rng.uniform(0, 2 * np.pi)  # Random point-on-wave
-
-    # ---- Pre-fault waveforms ----
-    va_pre = v_base * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[0])
-    vb_pre = v_base * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[1])
-    vc_pre = v_base * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[2])
-
-    ia_pre = i_peak_base * load_pu * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[0] - pf_angle)
-    ib_pre = i_peak_base * load_pu * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[1] - pf_angle)
-    ic_pre = i_peak_base * load_pu * np.sin(OMEGA * t[:FAULT_ONSET] + phi_v + phase_offsets[2] - pf_angle)
-
-    # ---- Post-fault waveforms ----
+    # --- Sample fault zone (only for actual faults) ---
     if fault_type == 0:
-        # No fault - continue normal operation with possible load change
-        load_change = rng.uniform(0.8, 1.3)  # Sudden load change
-        va_post = v_base * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0])
-        vb_post = v_base * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1])
-        vc_post = v_base * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2])
-        ia_post = i_peak_base * load_pu * load_change * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0] - pf_angle)
-        ib_post = i_peak_base * load_pu * load_change * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1] - pf_angle)
-        ic_post = i_peak_base * load_pu * load_change * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2] - pf_angle)
-
-        fault_zone = -1
-        protection_action = 0
-
-    elif fault_type == 1:
-        # SLG fault on phase A
-        # Fault current magnitude depends on grounding and location
-        # IEEE 551 / IEC 60909: i(t) = sqrt(2)*If*[sin(wt+θ-φ) - sin(θ-φ)*exp(-t/τ)]
-        # where θ = voltage angle at inception, φ = impedance angle ≈ atan(X/R)
-        if facility.grounding == "solid":
-            i_fault_mult = rng.uniform(3.0, 8.0) / (z_fault_pu + 0.01)
-        elif facility.grounding in ("low_r", "resistance"):
-            i_fault_mult = rng.uniform(1.5, 5.0) / (z_fault_pu + 0.05)
-        elif facility.grounding == "high_r":
-            i_fault_mult = rng.uniform(0.5, 2.0)  # Limited by grounding resistor
-        else:
-            i_fault_mult = rng.uniform(2.0, 6.0) / (z_fault_pu + 0.02)
-
-        i_fault_peak = min(i_fault_mult * i_peak_base, 20 * i_peak_base)
-        # Impedance angle φ = atan(X/R); fault inception angle on voltage wave
-        phi_z = np.arctan(facility.xr_ratio)  # Impedance angle
-        theta = phi_v + phase_offsets[0]       # Voltage angle at fault inception
-        alpha = theta - phi_z                  # Current reference angle
-
-        # Phase A: asymmetrical fault current with DC offset (IEEE 551 form)
-        # i(t) = I_peak * [sin(ωt + α) - sin(α) * exp(-t/τ)]
-        # At t=0: i(0) = I_peak*[sin(α) - sin(α)] = 0 (satisfies initial condition)
-        ia_post = i_fault_peak * (
-            np.sin(OMEGA * t_fault + alpha)
-            - np.sin(alpha) * np.exp(-t_fault / tau)
-        )
-        # Phases B, C: slightly affected (negative/zero sequence contribution)
-        neg_seq_factor = rng.uniform(0.05, 0.20)
-        ib_post = i_peak_base * load_pu * (1 + neg_seq_factor) * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1] - pf_angle)
-        ic_post = i_peak_base * load_pu * (1 + neg_seq_factor) * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2] - pf_angle)
-
-        # Voltage sag/swell depends on grounding method
-        # Governed by ratio m = Z0/Z1 (zero-seq to pos-seq impedance)
-        # Solidly grounded (m ≈ 1-3): unfaulted swell 1.0-1.25 pu, faulted sag 0.1-0.5 pu
-        # Low-R grounded (m ≈ 3-10): unfaulted swell 1.1-1.4 pu, faulted sag 0.15-0.55 pu
-        # High-R grounded (m → ∞): unfaulted swell up to √3=1.73 pu, faulted sag 0.3-0.8 pu
-        if facility.grounding == "solid":
-            v_sag = rng.uniform(0.10, 0.50)
-            v_swell = rng.uniform(1.00, 1.25)
-        elif facility.grounding in ("low_r", "resistance"):
-            v_sag = rng.uniform(0.15, 0.55)
-            v_swell = rng.uniform(1.10, 1.40)
-        elif facility.grounding == "high_r":
-            v_sag = rng.uniform(0.30, 0.80)   # Less collapse, limited fault current
-            v_swell = rng.uniform(1.40, 1.73)  # Up to line-to-line voltage
-        else:  # ungrounded
-            v_sag = rng.uniform(0.40, 0.90)
-            v_swell = rng.uniform(1.50, 1.73)
-
-        va_post = v_base * v_sag * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0])
-        vb_post = v_base * v_swell * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1])
-        vc_post = v_base * v_swell * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2])
-
-        fault_zone = 0 if fault_location < 0.2 else (1 if fault_location < 0.6 else 2)
-        # Protection action depends on grounding and zone
-        if facility.grounding == "high_r":
-            protection_action = 4  # Alarm only (HRG)
-        elif fault_zone == 0:
-            protection_action = 1  # Trip instantaneous (bus fault)
-        else:
-            protection_action = 2  # Trip with delay
-
-    elif fault_type == 2:
-        # Line-to-line fault (A-B)
-        i_fault_mult = rng.uniform(2.5, 7.0) / (z_fault_pu + 0.01)
-        i_fault_peak = min(i_fault_mult * i_peak_base, 18 * i_peak_base)
-
-        # Impedance angle and current reference (IEEE 551 form)
-        phi_z = np.arctan(facility.xr_ratio)
-        theta_a = phi_v + phase_offsets[0]
-        theta_b = phi_v + phase_offsets[1]
-        alpha_a = theta_a - phi_z
-        alpha_b = theta_b - phi_z
-
-        # Both faulted phases see high current with DC offset
-        ia_post = i_fault_peak * (
-            np.sin(OMEGA * t_fault + alpha_a)
-            - np.sin(alpha_a) * np.exp(-t_fault / tau)
-        )
-        ib_post = -i_fault_peak * (
-            np.sin(OMEGA * t_fault + alpha_b)
-            - np.sin(alpha_b) * np.exp(-t_fault / tau)
-        )
-        # Phase C relatively unaffected
-        ic_post = i_peak_base * load_pu * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2] - pf_angle)
-
-        # LL fault voltage collapse on both faulted phases
-        # Less grounding-dependent than SLG, but still varies with fault location
-        v_sag = rng.uniform(0.15, 0.55)
-        va_post = v_base * v_sag * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0])
-        vb_post = v_base * v_sag * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1])
-        vc_post = v_base * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2])
-
-        fault_zone = 0 if fault_location < 0.2 else (1 if fault_location < 0.6 else 2)
-        if fault_zone == 0:
-            protection_action = 1  # Trip instantaneous
-        else:
-            protection_action = 2  # Trip with delay
-
-    elif fault_type == 3:
-        # High-impedance arcing fault on phase A
-        # Much lower fault current, intermittent
-        if facility.grounding == "high_r":
-            i_hif_peak = rng.uniform(0.5, 5.0)  # Very low, amps
-        else:
-            i_hif_peak = rng.uniform(5.0, 50.0)  # Still relatively low
-
-        ia_post = _arcing_fault_current(t_fault, i_hif_peak, OMEGA, rng)
-        # Add load current back
-        ia_post += i_peak_base * load_pu * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0] - pf_angle)
-
-        ib_post = i_peak_base * load_pu * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1] - pf_angle)
-        ic_post = i_peak_base * load_pu * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2] - pf_angle)
-
-        # HIF causes minimal voltage disturbance on solidly grounded systems
-        # but significant on HRG/ungrounded (same physics as SLG, just less current)
-        if facility.grounding == "high_r":
-            v_sag = rng.uniform(0.85, 0.98)     # Slight sag on faulted phase
-            v_swell = rng.uniform(1.10, 1.50)   # Moderate swell (less than bolted SLG)
-        elif facility.grounding in ("low_r", "resistance"):
-            v_sag = rng.uniform(0.90, 0.99)
-            v_swell = rng.uniform(1.02, 1.15)
-        else:  # solid
-            v_sag = rng.uniform(0.92, 0.99)
-            v_swell = rng.uniform(1.00, 1.05)   # Barely noticeable on solidly grounded
-
-        va_post = v_base * v_sag * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[0])
-        vb_post = v_base * v_swell * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[1])
-        vc_post = v_base * v_swell * np.sin(OMEGA * t[FAULT_ONSET:] + phi_v + phase_offsets[2])
-
-        fault_zone = 0 if fault_location < 0.3 else (1 if fault_location < 0.7 else 2)
-        # HIF protection action
-        if facility.grounding == "high_r":
-            protection_action = 4  # Alarm only
-        else:
-            protection_action = 3  # ZSI block / delayed response
-
+        fault_zone = 3   # none
     else:
-        raise ValueError(f"Unknown fault type: {fault_type}")
+        fz_weights = np.array(profile["fault_zone_weights"], dtype=np.float64)
+        fz_weights /= fz_weights.sum()
+        fault_zone = int(rng.choice(3, p=fz_weights))
 
-    # ---- Concatenate pre + post ----
-    va = np.concatenate([va_pre, va_post])
-    vb = np.concatenate([vb_pre, vb_post])
-    vc = np.concatenate([vc_pre, vc_post])
-    ia = np.concatenate([ia_pre, ia_post])
-    ib = np.concatenate([ib_pre, ib_post])
-    ic = np.concatenate([ic_pre, ic_post])
+    # --- Generate pre-fault waveform ---
+    phi_v = rng.uniform(0, 2 * math.pi)
+    phi_i_lag = rng.uniform(0.35, 0.65)   # 20°–37° power factor angle
+    wf = _three_phase_prefault(t, v_peak, i_peak, phi_v, phi_i_lag)
 
-    # ---- Apply facility-specific distortions ----
+    # --- Apply fault ---
+    inception = FAULT_INCEPTION_SAMPLE + rng.integers(-10, 10)
+    inception = max(10, min(inception, N_SAMPLES_PER_WAVEFORM - 100))
 
-    # Harmonics (applied to full waveform for consistency)
-    if facility.harmonic_distortion > 0.001:
-        va = _add_harmonics(va, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
-        vb = _add_harmonics(vb, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
-        vc = _add_harmonics(vc, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
-        ia = _add_harmonics(ia, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
-        ib = _add_harmonics(ib, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
-        ic = _add_harmonics(ic, t, facility.harmonic_distortion * rng.uniform(0.5, 1.5), rng)
+    if fault_type == 1:    # SLG
+        wf = _apply_fault_slg(wf, t, inception, fault_mva, xr_ratio, v_peak, grounding)
+    elif fault_type == 2:  # LL
+        wf = _apply_fault_ll(wf, t, inception, fault_mva, xr_ratio, v_peak)
+    elif fault_type == 3:  # HIF
+        wf = _apply_fault_hif(wf, t, inception, v_peak, rng)
 
-    # CT saturation (current channels only, probabilistic)
-    if fault_type > 0 and rng.random() < facility.ct_saturation_prob:
-        severity = rng.uniform(0.2, 0.8)
-        ia = _ct_saturation(ia, severity)
-        if fault_type == 2:  # LL fault affects phase B too
-            ib = _ct_saturation(ib, severity * rng.uniform(0.5, 1.0))
+    # --- Zone attenuation ---
+    if fault_type != 0 and fault_zone < 3:
+        wf = _apply_zone_attenuation(wf, inception, fault_zone)
 
-    # Noise
-    va = _add_noise(va, facility.noise_snr_db, rng)
-    vb = _add_noise(vb, facility.noise_snr_db, rng)
-    vc = _add_noise(vc, facility.noise_snr_db, rng)
-    ia = _add_noise(ia, facility.noise_snr_db, rng)
-    ib = _add_noise(ib, facility.noise_snr_db, rng)
-    ic = _add_noise(ic, facility.noise_snr_db, rng)
+    # --- Add noise ---
+    wf = _add_noise(wf, profile["snr_db"], rng)
 
-    return {
-        'va': va, 'vb': vb, 'vc': vc,
-        'ia': ia, 'ib': ib, 'ic': ic,
-        'fault_type': fault_type,
-        'fault_zone': fault_zone if fault_type > 0 else -1,
-        'protection_action': protection_action,
-        'facility_id': list(FACILITY_PROFILES.keys())[
-            list(FACILITY_PROFILES.values()).index(facility)
-        ],
-        'metadata': {
-            'fault_location': float(fault_location),
-            'load_pu': float(load_pu),
-            'phi_v': float(phi_v),
-            'v_base': float(v_base),
-            'i_peak_base': float(i_peak_base),
-        }
-    }
+    # --- Protection action (v2: config-aware) ---
+    prot_action = _assign_protection_action(fault_type, fault_zone, cfg, grounding)
+
+    # --- Config features for model input (normalized) ---
+    config_features = np.array([
+        cfg["fault_mva"] / 500.0,
+        cfg["xr_ratio"] / 15.0,
+        cfg["source_count"] / 3.0,
+    ], dtype=np.float32)
+
+    return wf, fault_type, fault_zone, prot_action, cfg["id"], config_features
 
 
-def generate_facility_dataset(
+# ──────────────────────────────────────────────────────────────────
+# Main Generation Loop
+# ──────────────────────────────────────────────────────────────────
+
+def generate_facility(
     facility_id: int,
-    n_samples: int = 1000,
-    seed: int = 42,
-) -> dict:
-    """
-    Generate a complete dataset for one facility.
+    n_samples: int,
+    seed: int,
+    output_dir: Path,
+) -> None:
+    """Generate and save waveforms for one facility."""
+    profile = FACILITY_PROFILES[facility_id]
+    rng = np.random.default_rng(seed + facility_id)
 
-    Returns dict with:
-        - 'waveforms': np.ndarray (n_samples, 6, TOTAL_SAMPLES) [va,vb,vc,ia,ib,ic]
-        - 'fault_type': np.ndarray (n_samples,)
-        - 'fault_zone': np.ndarray (n_samples,)
-        - 'protection_action': np.ndarray (n_samples,)
-        - 'facility_id': int
-        - 'metadata': list of dicts
-    """
-    facility = FACILITY_PROFILES[facility_id]
-    rng = np.random.default_rng(seed + facility_id * 1000)
+    fdir = output_dir / f"facility_{facility_id}"
+    fdir.mkdir(parents=True, exist_ok=True)
 
-    # Sample fault types according to facility distribution
-    fault_types_list = list(facility.fault_type_dist.keys())
-    fault_probs = list(facility.fault_type_dist.values())
-    sampled_fault_types = rng.choice(fault_types_list, size=n_samples, p=fault_probs)
-
-    waveforms = np.zeros((n_samples, 6, TOTAL_SAMPLES), dtype=np.float32)
+    waveforms = np.zeros((n_samples, N_CHANNELS, N_SAMPLES_PER_WAVEFORM), dtype=np.float32)
     fault_types = np.zeros(n_samples, dtype=np.int64)
     fault_zones = np.zeros(n_samples, dtype=np.int64)
-    protection_actions = np.zeros(n_samples, dtype=np.int64)
-    metadata_list = []
+    prot_actions = np.zeros(n_samples, dtype=np.int64)
+    config_ids = np.zeros(n_samples, dtype=np.int64)
+    config_feats = np.zeros((n_samples, 3), dtype=np.float32)
 
     for i in range(n_samples):
-        sample = generate_single_sample(facility, int(sampled_fault_types[i]), rng)
-        waveforms[i, 0] = sample['va']
-        waveforms[i, 1] = sample['vb']
-        waveforms[i, 2] = sample['vc']
-        waveforms[i, 3] = sample['ia']
-        waveforms[i, 4] = sample['ib']
-        waveforms[i, 5] = sample['ic']
-        fault_types[i] = sample['fault_type']
-        fault_zones[i] = sample['fault_zone']
-        protection_actions[i] = sample['protection_action']
-        metadata_list.append(sample['metadata'])
+        wf, ft, fz, pa, cid, cf = _generate_sample(profile, rng)
+        waveforms[i] = wf
+        fault_types[i] = ft
+        fault_zones[i] = fz
+        prot_actions[i] = pa
+        config_ids[i] = cid
+        config_feats[i] = cf
 
-    return {
-        'waveforms': waveforms,
-        'fault_type': fault_types,
-        'fault_zone': fault_zones,
-        'protection_action': protection_actions,
-        'facility_id': facility_id,
-        'metadata': metadata_list,
-    }
+    # Save (backward-compatible with v1 + new config files)
+    np.save(fdir / "waveforms.npy", waveforms)
+    np.save(fdir / "fault_type.npy", fault_types)
+    np.save(fdir / "fault_zone.npy", fault_zones)
+    np.save(fdir / "protection_action.npy", prot_actions)
+    np.save(fdir / "config_id.npy", config_ids)             # NEW v2
+    np.save(fdir / "config_features.npy", config_feats)     # NEW v2
 
-
-def generate_all_facilities(
-    n_samples_per_facility: int = 1000,
-    seed: int = 42,
-    output_dir: str = "data/generated",
-) -> dict:
-    """
-    Generate datasets for all 5 facilities and save to disk.
-
-    Returns dict mapping facility_id -> dataset dict.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    all_data = {}
-
-    for fid in FACILITY_PROFILES:
-        print(f"Generating {n_samples_per_facility} samples for "
-              f"Facility {fid}: {FACILITY_PROFILES[fid].name}...")
-        dataset = generate_facility_dataset(fid, n_samples_per_facility, seed)
-
-        # Save as numpy archives
-        facility_dir = os.path.join(output_dir, f"facility_{fid}")
-        os.makedirs(facility_dir, exist_ok=True)
-
-        np.save(os.path.join(facility_dir, "waveforms.npy"), dataset['waveforms'])
-        np.save(os.path.join(facility_dir, "fault_type.npy"), dataset['fault_type'])
-        np.save(os.path.join(facility_dir, "fault_zone.npy"), dataset['fault_zone'])
-        np.save(os.path.join(facility_dir, "protection_action.npy"), dataset['protection_action'])
-
-        # Save metadata as JSON
-        with open(os.path.join(facility_dir, "metadata.json"), 'w') as f:
-            json.dump({
-                'facility_profile': {
-                    'name': FACILITY_PROFILES[fid].name,
-                    'voltage_kv': FACILITY_PROFILES[fid].voltage_kv,
-                    'fault_mva': FACILITY_PROFILES[fid].fault_mva,
-                    'xr_ratio': FACILITY_PROFILES[fid].xr_ratio,
-                    'grounding': FACILITY_PROFILES[fid].grounding,
-                    'description': FACILITY_PROFILES[fid].description,
-                },
-                'n_samples': n_samples_per_facility,
-                'seed': seed,
-                'waveform_params': {
-                    'freq_hz': FREQ_HZ,
-                    'samples_per_cycle': SAMPLES_PER_CYCLE,
-                    'total_cycles': TOTAL_CYCLES,
-                    'cycles_prefault': CYCLES_PREFAULT,
-                    'cycles_postfault': CYCLES_POSTFAULT,
-                    'sample_rate_hz': SAMPLE_RATE,
-                },
-                'label_counts': {
-                    'fault_type': {str(k): int(v) for k, v in
-                                   zip(*np.unique(dataset['fault_type'], return_counts=True))},
-                    'protection_action': {str(k): int(v) for k, v in
-                                          zip(*np.unique(dataset['protection_action'], return_counts=True))},
-                },
-            }, f, indent=2)
-
-        all_data[fid] = dataset
-        print(f"  -> Saved to {facility_dir}/")
-        print(f"     Fault types: {dict(zip(*np.unique(dataset['fault_type'], return_counts=True)))}")
-        print(f"     Protection actions: {dict(zip(*np.unique(dataset['protection_action'], return_counts=True)))}")
-
-    # Save summary
-    summary = {
-        'n_facilities': len(FACILITY_PROFILES),
-        'n_samples_per_facility': n_samples_per_facility,
-        'total_samples': n_samples_per_facility * len(FACILITY_PROFILES),
-        'facilities': {fid: FACILITY_PROFILES[fid].name for fid in FACILITY_PROFILES},
-        'fault_type_map': {0: 'no_fault', 1: 'SLG', 2: 'LL', 3: 'HIF'},
-        'protection_action_map': {
-            0: 'no_action', 1: 'trip_instantaneous', 2: 'trip_delayed',
-            3: 'zsi_block', 4: 'alarm_only'
-        },
-    }
-    with open(os.path.join(output_dir, "summary.json"), 'w') as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"\nDone. Total: {n_samples_per_facility * len(FACILITY_PROFILES)} samples across {len(FACILITY_PROFILES)} facilities.")
-    return all_data
+    # Stats
+    print(f"  Facility {facility_id} ({profile['name']}):")
+    print(f"    Samples:  {n_samples}")
+    print(f"    FT dist:  {np.bincount(fault_types, minlength=4)}")
+    print(f"    FZ dist:  {np.bincount(fault_zones, minlength=4)}")
+    print(f"    PA dist:  {np.bincount(prot_actions, minlength=5)}")
+    print(f"    Cfg dist: {np.bincount(config_ids, minlength=3)}")
+    print(f"    Saved to: {fdir}")
 
 
-# ============================================================================
-# CLI
-# ============================================================================
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="SecureRelayFL Synthetic Fault Waveform Generator")
+def main():
+    parser = argparse.ArgumentParser(description="SecureRelayFL waveform generator (v2)")
     parser.add_argument("--n-samples", type=int, default=1000, help="Samples per facility")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output-dir", type=str, default="data/generated", help="Output directory")
+    parser.add_argument(
+        "--output-dir", type=str, default="data/generated",
+        help="Output directory for generated data",
+    )
     args = parser.parse_args()
+    output_dir = Path(args.output_dir)
 
-    generate_all_facilities(args.n_samples, args.seed, args.output_dir)
+    print(f"SecureRelayFL v2 — Generating {args.n_samples} samples/facility, seed={args.seed}")
+    print(f"Output: {output_dir.resolve()}\n")
+
+    for fid in FACILITY_PROFILES:
+        generate_facility(fid, args.n_samples, args.seed, output_dir)
+
+    total = args.n_samples * len(FACILITY_PROFILES)
+    print(f"\nDone. {total} total samples across {len(FACILITY_PROFILES)} facilities.")
+
+
+if __name__ == "__main__":
+    main()

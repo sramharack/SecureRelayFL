@@ -1,325 +1,256 @@
 """
-SecureRelayFL — Axis 2: Differential Privacy Sweep
+SecureRelayFL — Axis 2: Differential Privacy Sweep (v2)
 
-Adds DP noise to client model updates before aggregation.
-Mechanism: clip L2 norm of update delta, add Gaussian noise calibrated to epsilon.
+Implements DPFedAvg: Gaussian mechanism applied to client updates before aggregation.
+Sweeps privacy budget ε ∈ [0.5, 1, 2, 5, 10, ∞] with fixed δ = 1/N².
+
+v2 changes:
+    - Uses cnn_v2 model by default (passes config_features)
 
 Usage:
     python -m securerelayfl.experiments.axis2_privacy --seed 42
-    python -m securerelayfl.experiments.axis2_privacy --quick --seed 42
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
-from collections import OrderedDict
-from typing import Optional
+from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
+
 import flwr as fl
-from flwr.common import (
-    FitRes,
-    Parameters,
-    Scalar,
-    ndarrays_to_parameters,
-    parameters_to_ndarrays,
-)
-from flwr.server import ServerConfig
-from flwr.server.client_proxy import ClientProxy
+from flwr.common import ndarrays_to_parameters
 from flwr.server.strategy import FedAvg
 
-from securerelayfl.models.fault_classifier import FaultClassifier, MultiTaskLoss
-from securerelayfl.fl.client import make_client_fn
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from securerelayfl.fl.client import FaultClient, get_parameters
+from securerelayfl.fl.server import get_model, get_evaluate_fn
 
 
-NUM_FACILITIES = 5
+# Privacy budgets to sweep (inf = no DP)
+EPSILON_VALUES = [0.5, 1.0, 2.0, 5.0, 10.0, float("inf")]
+DELTA_FACTOR = 1.0  # δ = DELTA_FACTOR / N² where N = total training samples
+
+
+def compute_noise_multiplier(
+    epsilon: float,
+    delta: float,
+    sensitivity: float = 1.0,
+) -> float:
+    """Compute Gaussian noise multiplier σ for (ε, δ)-DP.
+
+    Uses the analytic Gaussian mechanism:
+        σ = sensitivity * sqrt(2 * ln(1.25 / δ)) / ε
+    """
+    if epsilon == float("inf"):
+        return 0.0
+    import math
+    return sensitivity * math.sqrt(2 * math.log(1.25 / delta)) / epsilon
+
+
+def clip_and_noise_parameters(
+    parameters: list[np.ndarray],
+    clip_norm: float,
+    noise_multiplier: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Apply gradient clipping and Gaussian noise for DP.
+
+    1. Clip: scale parameter update so L2 norm ≤ clip_norm
+    2. Noise: add N(0, (clip_norm * noise_multiplier)²) per parameter
+    """
+    if noise_multiplier == 0.0:
+        return parameters
+
+    # Compute L2 norm across all parameter tensors
+    total_norm = np.sqrt(sum(np.sum(p ** 2) for p in parameters))
+
+    # Clip
+    clip_factor = min(1.0, clip_norm / (total_norm + 1e-10))
+    clipped = [p * clip_factor for p in parameters]
+
+    # Add noise
+    noise_std = clip_norm * noise_multiplier
+    noised = [
+        p + rng.normal(0, noise_std, p.shape).astype(p.dtype)
+        for p in clipped
+    ]
+    return noised
 
 
 class DPFedAvg(FedAvg):
-    """
-    FedAvg with client-level differential privacy.
-
-    Each round:
-        1. Receive client updates
-        2. Compute update delta (client_params - global_params)
-        3. Clip delta L2 norm to max_norm
-        4. Add Gaussian noise calibrated to (max_norm, epsilon, delta)
-        5. Apply noised delta to global model
-    """
+    """FedAvg with client-level differential privacy (Gaussian mechanism)."""
 
     def __init__(
         self,
-        epsilon: float = 1.0,
-        dp_delta: float = 1e-5,
-        max_norm: float = 1.0,
+        noise_multiplier: float = 0.0,
+        clip_norm: float = 1.0,
         seed: int = 42,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.epsilon = epsilon
-        self.dp_delta = dp_delta
-        self.max_norm = max_norm
-        self.np_rng = np.random.RandomState(seed)
-
-        # Compute noise multiplier from epsilon via Gaussian mechanism
-        # sigma = max_norm * sqrt(2 * ln(1.25/delta)) / epsilon
-        if epsilon < float("inf"):
-            self.sigma = max_norm * np.sqrt(2 * np.log(1.25 / dp_delta)) / epsilon
-        else:
-            self.sigma = 0.0
-
-        self.round_log = []
+        self.noise_multiplier = noise_multiplier
+        self.clip_norm = clip_norm
+        self.rng = np.random.default_rng(seed)
 
     def aggregate_fit(self, server_round, results, failures):
-        """Clip and noise client updates before standard aggregation."""
-
         if not results:
             return None, {}
 
-        # Get current global model (from first client's perspective, pre-training)
-        # We clip each client's full parameter set independently
-        clipped_results = []
-        norms_before = []
-        norms_after = []
-
-        for client, fit_res in results:
-            ndarrays = parameters_to_ndarrays(fit_res.parameters)
-
-            # Compute L2 norm of full parameter vector
-            flat = np.concatenate([a.flatten() for a in ndarrays])
-            norm = np.linalg.norm(flat)
-            norms_before.append(float(norm))
-
-            # Clip
-            clip_factor = min(1.0, self.max_norm / (norm + 1e-10))
-            clipped = [a * clip_factor for a in ndarrays]
-
-            # Add noise per-parameter
-            if self.sigma > 0:
-                noised = [
-                    a + self.np_rng.normal(0, self.sigma, a.shape).astype(a.dtype)
-                    for a in clipped
-                ]
-            else:
-                noised = clipped
-
-            clipped_norm = np.linalg.norm(np.concatenate([a.flatten() for a in noised]))
-            norms_after.append(float(clipped_norm))
-
-            fit_res = FitRes(
-                status=fit_res.status,
-                parameters=ndarrays_to_parameters(noised),
-                num_examples=fit_res.num_examples,
-                metrics=fit_res.metrics,
+        # Apply DP to each client's parameters
+        dp_results = []
+        for client_proxy, fit_res in results:
+            params = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            dp_params = clip_and_noise_parameters(
+                params, self.clip_norm, self.noise_multiplier, self.rng
             )
-            clipped_results.append((client, fit_res))
+            fit_res.parameters = fl.common.ndarrays_to_parameters(dp_params)
+            dp_results.append((client_proxy, fit_res))
 
-        self.round_log.append({
-            "round": server_round,
-            "epsilon": self.epsilon,
-            "sigma": self.sigma,
-            "avg_norm_before": np.mean(norms_before),
-            "avg_norm_after": np.mean(norms_after),
-        })
-
-        return super().aggregate_fit(server_round, clipped_results, failures)
+        return super().aggregate_fit(server_round, dp_results, failures)
 
 
-def get_initial_parameters():
-    model = FaultClassifier()
-    ndarrays = [val.cpu().numpy() for _, val in model.state_dict().items()]
-    return fl.common.ndarrays_to_parameters(ndarrays)
+def run_dp_experiment(
+    epsilon: float,
+    model_name: str,
+    data_dir: str,
+    rounds: int,
+    local_epochs: int,
+    batch_size: int,
+    lr: float,
+    clip_norm: float,
+    n_total_samples: int,
+    seed: int,
+    output_dir: Path,
+) -> dict:
+    """Run a single DP configuration."""
+    device = torch.device("cpu")
+    n_clients = 5
 
+    delta = DELTA_FACTOR / (n_total_samples ** 2)
+    noise_mult = compute_noise_multiplier(epsilon, delta)
 
-def weighted_average(metrics):
-    total = sum(n for n, _ in metrics)
-    if total == 0:
-        return {}
-    result = {}
-    for key in ["fault_type_acc", "fault_zone_acc", "protection_action_acc"]:
-        result[key] = sum(n * m.get(key, 0.0) for n, m in metrics) / total
-    return result
+    tag = f"eps_{epsilon:.1f}" if epsilon != float("inf") else "eps_inf"
+    exp_dir = output_dir / tag
+    exp_dir.mkdir(parents=True, exist_ok=True)
 
-
-def get_evaluate_fn(data_dir, device, seed):
-    from data.dataset import get_dataloaders
-
-    _, _, test_loader, _ = get_dataloaders(
-        data_dir=data_dir, facility_ids=None,
-        batch_size=64, val_split=0.15, test_split=0.15, seed=seed,
-    )
-    model = FaultClassifier().to(device)
-    criterion = MultiTaskLoss().to(device)
-
-    def evaluate(server_round, parameters, config):
-        params_dict = zip(model.state_dict().keys(), parameters)
-        state_dict = OrderedDict(
-            {k: torch.tensor(v).to(device) for k, v in params_dict}
-        )
-        model.load_state_dict(state_dict, strict=True)
-        model.eval()
-
-        total_loss = 0.0
-        correct_ft, correct_fz, correct_pa = 0, 0, 0
-        n_samples = 0
-
-        with torch.no_grad():
-            for wf, ft, fz, pa in test_loader:
-                wf, ft, fz, pa = (x.to(device) for x in (wf, ft, fz, pa))
-                preds = model(wf)
-                loss, _ = criterion(preds, ft, fz, pa)
-                bs = wf.size(0)
-                total_loss += loss.item() * bs
-                correct_ft += (preds["fault_type"].argmax(1) == ft).sum().item()
-                correct_fz += (preds["fault_zone"].argmax(1) == fz).sum().item()
-                correct_pa += (preds["protection_action"].argmax(1) == pa).sum().item()
-                n_samples += bs
-
-        avg_loss = total_loss / max(n_samples, 1)
-        return float(avg_loss), {
-            "fault_type_acc": correct_ft / max(n_samples, 1),
-            "fault_zone_acc": correct_fz / max(n_samples, 1),
-            "protection_action_acc": correct_pa / max(n_samples, 1),
-        }
-
-    return evaluate
-
-
-def run_one_experiment(epsilon, args, device):
-    label = f"eps_{epsilon}" if epsilon < float("inf") else "eps_inf"
-    print(f"\n{'='*60}")
-    print(f"  DP sweep: epsilon={epsilon}, sigma={'computed' if epsilon < float('inf') else '0'}")
-    print(f"{'='*60}")
+    init_model = get_model(model_name, device)
+    init_params = ndarrays_to_parameters(get_parameters(init_model))
 
     strategy = DPFedAvg(
-        epsilon=epsilon,
-        dp_delta=1e-5,
-        max_norm=args.max_norm,
-        seed=args.seed,
+        noise_multiplier=noise_mult,
+        clip_norm=clip_norm,
+        seed=seed,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
-        min_fit_clients=NUM_FACILITIES,
-        min_evaluate_clients=NUM_FACILITIES,
-        min_available_clients=NUM_FACILITIES,
-        initial_parameters=get_initial_parameters(),
-        evaluate_metrics_aggregation_fn=weighted_average,
-        evaluate_fn=get_evaluate_fn(args.data_dir, device, args.seed),
-        on_fit_config_fn=lambda r: {"local_epochs": args.local_epochs},
+        min_fit_clients=n_clients,
+        min_evaluate_clients=n_clients,
+        min_available_clients=n_clients,
+        initial_parameters=init_params,
+        evaluate_fn=get_evaluate_fn(model_name, data_dir, device, exp_dir),
     )
 
-    cfn = make_client_fn(
-        model_name="cnn",
-        data_dir=args.data_dir,
-        local_epochs=args.local_epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device="cpu",
-        seed=args.seed,
+    client_fn_partial = partial(
+        lambda cid, **kw: FaultClient(facility_id=int(cid), **kw),
+        model_name=model_name,
+        data_dir=data_dir,
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        lr=lr,
+        fedprox_mu=0.0,
+        device=device,
     )
 
     t0 = time.time()
-    history = fl.simulation.start_simulation(
-        client_fn=cfn,
-        num_clients=NUM_FACILITIES,
-        config=ServerConfig(num_rounds=args.rounds),
+    fl.simulation.start_simulation(
+        client_fn=client_fn_partial,
+        num_clients=n_clients,
+        config=fl.server.ServerConfig(num_rounds=rounds),
         strategy=strategy,
+        ray_init_args={"num_gpus": 0},
         client_resources={"num_cpus": 1, "num_gpus": 0.0},
-        ray_init_args={"num_gpus": 0, "include_dashboard": False},
     )
     elapsed = time.time() - t0
 
-    # Extract metrics
-    cm = []
-    if history.metrics_centralized:
-        rounds_seen = set()
-        for key, values in history.metrics_centralized.items():
-            for r, val in values:
-                if r not in rounds_seen:
-                    rounds_seen.add(r)
-                    cm.append({"round": r})
-                entry = next(e for e in cm if e["round"] == r)
-                entry[key] = val
-
-    best_pa = max(cm, key=lambda x: x.get("protection_action_acc", 0)) if cm else {}
-    final = cm[-1] if cm else {}
+    # Load final round metrics
+    metrics_path = exp_dir / "round_metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path) as f:
+            round_metrics = json.load(f)
+        final = round_metrics[-1] if round_metrics else {}
+    else:
+        final = {}
 
     result = {
         "epsilon": epsilon,
-        "label": label,
-        "sigma": strategy.sigma,
-        "max_norm": args.max_norm,
-        "training_time_s": elapsed,
-        "best_round": best_pa,
-        "final_round": final,
-        "dp_log": strategy.round_log,
-        "all_rounds": cm,
+        "delta": delta,
+        "noise_multiplier": noise_mult,
+        "clip_norm": clip_norm,
+        "elapsed_s": elapsed,
+        **{k: v for k, v in final.items() if k != "round"},
     }
 
-    print(f"  Sigma: {strategy.sigma:.4f}")
-    print(f"  Time: {elapsed:.0f}s")
-    if best_pa:
-        print(f"  Best PA: round {best_pa.get('round','?')} — "
-              f"FT={best_pa.get('fault_type_acc',0):.3f} "
-              f"PA={best_pa.get('protection_action_acc',0):.3f}")
+    with open(exp_dir / "summary.json", "w") as f:
+        json.dump(result, f, indent=2)
 
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Axis 2: DP Privacy Sweep")
+    parser = argparse.ArgumentParser(description="Axis 2: DP privacy sweep")
+    parser.add_argument("--model", type=str, default="cnn_v2", choices=["cnn_v1", "cnn_v2"])
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--max-norm", type=float, default=1.0,
-                        help="L2 norm clipping bound for client updates")
-    parser.add_argument("--data-dir", type=str, default="data/generated")
+    parser.add_argument("--clip-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--data-dir", type=str, default="data/generated")
     parser.add_argument("--output-dir", type=str, default="results/axis2_privacy")
-    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--n-samples", type=int, default=5000,
+                        help="Total training samples (for δ computation)")
     args = parser.parse_args()
-
-    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu"
-    os.makedirs(args.output_dir, exist_ok=True)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.quick:
-        epsilons = [1.0, 10.0, float("inf")]
-    else:
-        epsilons = [0.5, 1.0, 2.0, 5.0, 10.0, float("inf")]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Running DP sweep: {len(epsilons)} epsilon values")
-    print(f"Max norm: {args.max_norm}, Rounds: {args.rounds}")
+    print(f"Axis 2 — DP Sweep: {len(EPSILON_VALUES)} configurations")
+    print(f"Model: {args.model} | Rounds: {args.rounds} | Clip: {args.clip_norm}\n")
 
     all_results = []
-    for eps in epsilons:
-        result = run_one_experiment(eps, args, device)
+    for i, eps in enumerate(EPSILON_VALUES):
+        eps_str = f"ε={eps}" if eps != float("inf") else "ε=∞ (no DP)"
+        print(f"[{i+1}/{len(EPSILON_VALUES)}] {eps_str}")
+
+        result = run_dp_experiment(
+            epsilon=eps,
+            model_name=args.model,
+            data_dir=args.data_dir,
+            rounds=args.rounds,
+            local_epochs=args.local_epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            clip_norm=args.clip_norm,
+            n_total_samples=args.n_samples,
+            seed=args.seed,
+            output_dir=output_dir,
+        )
         all_results.append(result)
+        print(f"  → PA={result.get('acc_pa', 'N/A'):.3f}  σ={result['noise_multiplier']:.4f}\n")
 
-        with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-            json.dump(all_results, f, indent=2, default=str)
+    # Save consolidated results
+    with open(output_dir / "all_results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
 
-    # Summary
-    print("\n" + "=" * 70)
-    print("DP PRIVACY SWEEP SUMMARY")
-    print("=" * 70)
-    print(f"{'Epsilon':>10} {'Sigma':>10} {'Best FT':>8} {'Best PA':>8} {'Final PA':>9}")
-    print("-" * 50)
-    for r in all_results:
-        bp = r["best_round"]
-        fp = r["final_round"]
-        eps_str = f"{r['epsilon']:.1f}" if r["epsilon"] < float("inf") else "inf"
-        print(f"{eps_str:>10} {r['sigma']:>10.4f} "
-              f"{bp.get('fault_type_acc',0):>8.3f} "
-              f"{bp.get('protection_action_acc',0):>8.3f} "
-              f"{fp.get('protection_action_acc',0):>9.3f}")
-
-    print(f"\nResults saved to {args.output_dir}/results.json")
+    print(f"Done. Results saved to {output_dir}")
 
 
 if __name__ == "__main__":

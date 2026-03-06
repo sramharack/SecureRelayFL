@@ -1,229 +1,199 @@
 """
-SecureRelayFL — Flower FL Client
+SecureRelayFL — Flower FL Client (v2)
 
-Each client represents one industrial facility, training on its local data only
-and communicating model updates to the aggregation server.
+v2 changes:
+    - Unpacks config_features from dataloader, passes to model
+    - Supports both cnn_v1 and cnn_v2 models via model_name parameter
+    - FedProx proximal term support (mu > 0)
 """
 
-import flwr as fl
-import torch
-import torch.optim as optim
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-from collections import OrderedDict
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
+import flwr as fl
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from data.dataset import FaultWaveformDataset
-from securerelayfl.models.fault_classifier import FaultClassifier, MultiTaskLoss
-from securerelayfl.models.tcn_classifier import FaultClassifierTCN
 
 
-class RelayClient(fl.client.NumPyClient):
-    """Flower client for one industrial facility."""
+def get_model(model_name: str, device: torch.device) -> nn.Module:
+    if model_name == "cnn_v1":
+        from securerelayfl.models.fault_classifier import FaultClassifier
+        return FaultClassifier().to(device)
+    elif model_name == "cnn_v2":
+        from securerelayfl.models.fault_classifier_v2 import FaultClassifierV2
+        return FaultClassifierV2().to(device)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
+def set_parameters(model: nn.Module, parameters: list[np.ndarray]) -> None:
+    """Set model parameters from a list of NumPy arrays."""
+    params_dict = zip(model.state_dict().keys(), parameters)
+    state_dict = {k: torch.tensor(v) for k, v in params_dict}
+    model.load_state_dict(state_dict, strict=True)
+
+
+def get_parameters(model: nn.Module) -> list[np.ndarray]:
+    """Get model parameters as a list of NumPy arrays."""
+    return [val.cpu().numpy() for _, val in model.state_dict().items()]
+
+
+class FaultClient(fl.client.NumPyClient):
+    """Flower client for one facility.
+
+    Args:
+        facility_id: Which facility this client represents (0-4).
+        model_name:  'cnn_v1' or 'cnn_v2'.
+        data_dir:    Path to generated data.
+        local_epochs: Number of local training epochs per FL round.
+        batch_size:  Training batch size.
+        lr:          Learning rate.
+        fedprox_mu:  FedProx proximal term weight. 0 = pure FedAvg.
+        device:      Torch device.
+    """
 
     def __init__(
         self,
         facility_id: int,
-        model_name: str = "cnn",
+        model_name: str = "cnn_v2",
         data_dir: str = "data/generated",
-        local_epochs: int = 3,
+        local_epochs: int = 1,
         batch_size: int = 64,
-        lr: float = 1e-3,
-        device: str = "cpu",
-        seed: int = 42,
+        lr: float = 3e-4,
+        fedprox_mu: float = 0.0,
+        device: torch.device | None = None,
     ):
         self.facility_id = facility_id
-        self.device = device
+        self.model_name = model_name
         self.local_epochs = local_epochs
+        self.batch_size = batch_size
         self.lr = lr
+        self.fedprox_mu = fedprox_mu
+        self.device = device or torch.device("cpu")
 
-        # ---- Model ----
-        if model_name == "cnn":
-            self.model = FaultClassifier().to(device)
-        elif model_name == "tcn":
-            self.model = FaultClassifierTCN().to(device)
-        else:
-            raise ValueError(f"Unknown model: {model_name}")
-        self.criterion = MultiTaskLoss().to(device)
+        # Model
+        self.model = get_model(model_name, self.device)
 
-        # ---- Data (this facility only) ----
+        # Data — single facility
         dataset = FaultWaveformDataset(
-            data_dir=data_dir,
-            facility_ids=[facility_id],
-            normalize=True,
+            data_dir=data_dir, facility_ids=[facility_id]
         )
 
-        n = len(dataset)
-        n_val = int(n * 0.15)
-        n_train = n - n_val
-        generator = torch.Generator().manual_seed(seed)
+        # Train/val split (80/20)
+        n_val = int(len(dataset) * 0.2)
+        n_train = len(dataset) - n_val
         train_ds, val_ds = torch.utils.data.random_split(
-            dataset, [n_train, n_val], generator=generator,
+            dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42 + facility_id),
         )
-
-        self.train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        self.train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, num_workers=0
         )
-        self.val_loader = torch.utils.data.DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False,
+        self.val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False, num_workers=0
         )
         self.n_train = n_train
         self.n_val = n_val
 
-    def get_parameters(self, config):
-        """Return model parameters as a list of numpy arrays."""
-        return [
-            val.cpu().numpy()
-            for _, val in self.model.state_dict().items()
-        ]
+    def get_parameters(self, config: dict[str, Any]) -> list[np.ndarray]:
+        return get_parameters(self.model)
 
-    def set_parameters(self, parameters):
-        """Set model parameters from a list of numpy arrays."""
-        params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = OrderedDict(
-            {k: torch.tensor(v) for k, v in params_dict}
-        )
-        self.model.load_state_dict(state_dict, strict=True)
+    def fit(
+        self, parameters: list[np.ndarray], config: dict[str, Any]
+    ) -> tuple[list[np.ndarray], int, dict[str, Any]]:
+        """Local training round."""
+        set_parameters(self.model, parameters)
 
-    def fit(self, parameters, config):
-        """Train on local data for local_epochs, return updated parameters."""
-        self.set_parameters(parameters)
+        # Save global model for FedProx proximal term
+        if self.fedprox_mu > 0:
+            global_params = copy.deepcopy(
+                [p.data.clone() for p in self.model.parameters()]
+            )
 
-        # Allow server to override local_epochs via config
-        local_epochs = config.get("local_epochs", self.local_epochs)
-
-        optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.lr, weight_decay=1e-4,
-        )
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
+        loss_fn = nn.CrossEntropyLoss()
         self.model.train()
 
-        for _ in range(local_epochs):
-            for wf, ft, fz, pa in self.train_loader:
-                wf = wf.to(self.device)
-                ft = ft.to(self.device)
-                fz = fz.to(self.device)
-                pa = pa.to(self.device)
+        for _ in range(self.local_epochs):
+            for batch in self.train_loader:
+                wf, cf, ft, fz, pa = batch
+                wf, cf = wf.to(self.device), cf.to(self.device)
+                ft, fz, pa = ft.to(self.device), fz.to(self.device), pa.to(self.device)
+
+                if self.model_name == "cnn_v2":
+                    preds = self.model(wf, cf)
+                else:
+                    preds = self.model(wf)
+
+                loss = (
+                    loss_fn(preds["fault_type"], ft)
+                    + loss_fn(preds["fault_zone"], fz)
+                    + loss_fn(preds["protection_action"], pa)
+                )
+
+                # FedProx proximal term
+                if self.fedprox_mu > 0:
+                    prox = 0.0
+                    for p_local, p_global in zip(self.model.parameters(), global_params):
+                        prox += ((p_local - p_global) ** 2).sum()
+                    loss += (self.fedprox_mu / 2.0) * prox
 
                 optimizer.zero_grad()
-                preds = self.model(wf)
-                loss, _ = self.criterion(preds, ft, fz, pa)
                 loss.backward()
                 optimizer.step()
 
-        return self.get_parameters(config={}), self.n_train, {}
+        return get_parameters(self.model), self.n_train, {}
 
-    def evaluate(self, parameters, config):
-        """Evaluate on local validation data."""
-        self.set_parameters(parameters)
+    def evaluate(
+        self, parameters: list[np.ndarray], config: dict[str, Any]
+    ) -> tuple[float, int, dict[str, Any]]:
+        """Local evaluation."""
+        set_parameters(self.model, parameters)
         self.model.eval()
+        loss_fn = nn.CrossEntropyLoss()
 
         total_loss = 0.0
         correct_ft, correct_fz, correct_pa = 0, 0, 0
-        n_samples = 0
+        total = 0
 
         with torch.no_grad():
-            for wf, ft, fz, pa in self.val_loader:
-                wf = wf.to(self.device)
-                ft = ft.to(self.device)
-                fz = fz.to(self.device)
-                pa = pa.to(self.device)
+            for batch in self.val_loader:
+                wf, cf, ft, fz, pa = batch
+                wf, cf = wf.to(self.device), cf.to(self.device)
+                ft, fz, pa = ft.to(self.device), fz.to(self.device), pa.to(self.device)
 
-                preds = self.model(wf)
-                loss, _ = self.criterion(preds, ft, fz, pa)
+                if self.model_name == "cnn_v2":
+                    preds = self.model(wf, cf)
+                else:
+                    preds = self.model(wf)
 
-                batch_size = wf.size(0)
-                total_loss += loss.item() * batch_size
+                loss = (
+                    loss_fn(preds["fault_type"], ft)
+                    + loss_fn(preds["fault_zone"], fz)
+                    + loss_fn(preds["protection_action"], pa)
+                )
+                total_loss += loss.item() * ft.size(0)
+
                 correct_ft += (preds["fault_type"].argmax(1) == ft).sum().item()
                 correct_fz += (preds["fault_zone"].argmax(1) == fz).sum().item()
                 correct_pa += (preds["protection_action"].argmax(1) == pa).sum().item()
-                n_samples += batch_size
+                total += ft.size(0)
 
-        avg_loss = total_loss / max(n_samples, 1)
         metrics = {
-            "fault_type_acc": correct_ft / max(n_samples, 1),
-            "fault_zone_acc": correct_fz / max(n_samples, 1),
-            "protection_action_acc": correct_pa / max(n_samples, 1),
+            "acc_ft": correct_ft / max(total, 1),
+            "acc_fz": correct_fz / max(total, 1),
+            "acc_pa": correct_pa / max(total, 1),
+            "facility_id": self.facility_id,
         }
-        return float(avg_loss), n_samples, metrics
-class FedProxClient(RelayClient):
-    """RelayClient with FedProx proximal term."""
 
-    def __init__(self, mu: float = 0.01, **kwargs):
-        super().__init__(**kwargs)
-        self.mu = mu
-
-    def fit(self, parameters, config):
-        self.set_parameters(parameters)
-        # Save global params for proximal term
-        global_params = [p.clone().detach() for p in self.model.parameters()]
-
-        local_epochs = config.get("local_epochs", self.local_epochs)
-        optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.lr, weight_decay=1e-4,
-        )
-        self.model.train()
-
-        for _ in range(local_epochs):
-            for wf, ft, fz, pa in self.train_loader:
-                wf = wf.to(self.device)
-                ft = ft.to(self.device)
-                fz = fz.to(self.device)
-                pa = pa.to(self.device)
-
-                optimizer.zero_grad()
-                preds = self.model(wf)
-                loss, _ = self.criterion(preds, ft, fz, pa)
-
-                # Proximal term: (mu/2) * ||w - w_global||^2
-                prox = 0.0
-                for p, gp in zip(self.model.parameters(), global_params):
-                    prox += (p - gp).norm(2) ** 2
-                loss = loss + (self.mu / 2.0) * prox
-
-                loss.backward()
-                optimizer.step()
-
-        return self.get_parameters(config={}), self.n_train, {}
-
-
-def make_client_fn(model_name, data_dir, local_epochs, batch_size, lr, device, seed,
-                   fedprox_mu=None):
-    """Return a client_fn closure. If fedprox_mu is set, use FedProxClient."""
-    def client_fn(cid: str) -> fl.client.Client:
-        if fedprox_mu is not None and fedprox_mu > 0:
-            return FedProxClient(
-                mu=fedprox_mu,
-                facility_id=int(cid),
-                model_name=model_name,
-                data_dir=data_dir,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                device=device,
-                seed=seed,
-            ).to_client()
-        else:
-            return RelayClient(
-                facility_id=int(cid),
-                model_name=model_name,
-                data_dir=data_dir,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                device=device,
-                seed=seed,
-            ).to_client()
-    return client_fn
-
-def make_client_fn(model_name, data_dir, local_epochs, batch_size, lr, device, seed):
-    """Return a client_fn closure for Flower simulation."""
-    def client_fn(cid: str) -> fl.client.Client:
-        return RelayClient(
-            facility_id=int(cid),
-            model_name=model_name,
-            data_dir=data_dir,
-            local_epochs=local_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            device=device,
-            seed=seed,
-        ).to_client()
-    return client_fn
+        return total_loss / max(total, 1), self.n_val, metrics
