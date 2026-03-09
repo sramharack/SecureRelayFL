@@ -2,7 +2,7 @@
 
 **Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks**
 
-> Paper submitted to [MAIN 2026](https://main-conference.org/) (Mediterranean Artificial Intelligence and Networking Conference), Palermo, Italy, July 1–3, 2026. IEEE ComSoc co-sponsored, IEEE Xplore indexed.
+> Paper to be submitted to [MAIN 2026](https://main-conference.org/) (Mediterranean Artificial Intelligence and Networking Conference), Palermo, Italy, July 1–3, 2026. IEEE ComSoc co-sponsored, IEEE Xplore indexed.
 
 ## Overview
 
