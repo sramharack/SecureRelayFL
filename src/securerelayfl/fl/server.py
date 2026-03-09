@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -120,9 +119,8 @@ def get_evaluate_fn(
             json.dump(round_metrics, f, indent=2)
 
         # Save best model
-        if server_round == 1 or metrics["acc_pa"] >= max(
-            m["acc_pa"] for m in round_metrics[:-1]
-        ):
+        prev = [m["acc_pa"] for m in round_metrics[:-1]]
+        if not prev or metrics["acc_pa"] >= max(prev):
             torch.save(model.state_dict(), output_dir / "best_model.pt")
 
         return avg_loss, metrics
@@ -130,26 +128,32 @@ def get_evaluate_fn(
     return evaluate
 
 
-def client_fn(
-    cid: str,
+def make_client_fn(
     model_name: str,
     data_dir: str,
     local_epochs: int,
     batch_size: int,
     lr: float,
     fedprox_mu: float,
-) -> FaultClient:
-    """Flower client factory for simulation."""
-    return FaultClient(
-        facility_id=int(cid),
-        model_name=model_name,
-        data_dir=data_dir,
-        local_epochs=local_epochs,
-        batch_size=batch_size,
-        lr=lr,
-        fedprox_mu=fedprox_mu,
-        device=torch.device("cpu"),  # clients always on CPU for Ray sim
-    )
+):
+    """Return a Flower 1.12 client_fn(context) factory."""
+
+    def client_fn(context: fl.common.Context) -> fl.client.Client:
+        # Flower 1.12: partition ID from context
+        partition_id = int(context.node_config.get("partition-id", 0))
+        numpy_client = FaultClient(
+            facility_id=partition_id,
+            model_name=model_name,
+            data_dir=data_dir,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            fedprox_mu=fedprox_mu,
+            device=torch.device("cpu"),
+        )
+        return numpy_client.to_client()
+
+    return client_fn
 
 
 def main():
@@ -200,9 +204,8 @@ def main():
         evaluate_fn=get_evaluate_fn(args.model, args.data_dir, device, out_dir),
     )
 
-    # Client factory
-    client_fn_partial = partial(
-        client_fn,
+    # Client factory (Flower 1.12 Context-based API)
+    client_fn = make_client_fn(
         model_name=args.model,
         data_dir=args.data_dir,
         local_epochs=args.local_epochs,
@@ -215,7 +218,7 @@ def main():
 
     # Flower simulation
     fl.simulation.start_simulation(
-        client_fn=client_fn_partial,
+        client_fn=client_fn,
         num_clients=n_clients,
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,

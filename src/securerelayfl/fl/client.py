@@ -39,7 +39,9 @@ def get_model(model_name: str, device: torch.device) -> nn.Module:
 def set_parameters(model: nn.Module, parameters: list[np.ndarray]) -> None:
     """Set model parameters from a list of NumPy arrays."""
     params_dict = zip(model.state_dict().keys(), parameters)
-    state_dict = {k: torch.tensor(v) for k, v in params_dict}
+    state_dict = {
+        k: torch.from_numpy(np.copy(v)) for k, v in params_dict
+    }
     model.load_state_dict(state_dict, strict=True)
 
 

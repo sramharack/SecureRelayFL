@@ -155,20 +155,22 @@ def run_dp_experiment(
         evaluate_fn=get_evaluate_fn(model_name, data_dir, device, exp_dir),
     )
 
-    client_fn_partial = partial(
-        lambda cid, **kw: FaultClient(facility_id=int(cid), **kw),
-        model_name=model_name,
-        data_dir=data_dir,
-        local_epochs=local_epochs,
-        batch_size=batch_size,
-        lr=lr,
-        fedprox_mu=0.0,
-        device=device,
-    )
+    def _client_fn(context: fl.common.Context) -> fl.client.Client:
+        partition_id = int(context.node_config.get("partition-id", 0))
+        return FaultClient(
+            facility_id=partition_id,
+            model_name=model_name,
+            data_dir=data_dir,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            fedprox_mu=0.0,
+            device=device,
+        ).to_client()
 
     t0 = time.time()
     fl.simulation.start_simulation(
-        client_fn=client_fn_partial,
+        client_fn=_client_fn,
         num_clients=n_clients,
         config=fl.server.ServerConfig(num_rounds=rounds),
         strategy=strategy,
