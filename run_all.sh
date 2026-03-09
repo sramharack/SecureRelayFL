@@ -1,167 +1,259 @@
 #!/usr/bin/env bash
-# SecureRelayFL v2 — Full Paper Results Run
-# Estimated wall time: 4-6 hours on CPU
-# Run from repo root: bash run_all.sh 2>&1 | tee run_all.log
-set -e
+# ============================================================================
+# SecureRelayFL — Full Experiment Pipeline
+# ============================================================================
+# Runs the complete experiment from data generation through figure production.
+#
+# Usage:
+#   chmod +x run_all.sh
+#   ./run_all.sh              # Run everything
+#   ./run_all.sh --skip-data  # Skip data generation (if data/ already exists)
+#   ./run_all.sh --only-figures  # Only regenerate figures from existing results
+#
+# Requirements:
+#   Python 3.10+, packages in requirements.txt
+#   ~30 min on a modern CPU (no GPU required)
+# ============================================================================
 
+set -euo pipefail
+
+# ── Configuration ──────────────────────────────────────────────
 SEED=42
-N_SAMPLES=1000
-EPOCHS=50
-ROUNDS=50
+FL_ROUNDS=50
+LOCAL_EPOCHS=1
+BATCH_SIZE=64
 LR=3e-4
-MODEL=cnn_v2
+N_FACILITIES=5
+SAMPLES_PER_FACILITY=1000
 
-echo "========================================"
-echo "SecureRelayFL v2 — Full Paper Run"
-echo "Seed=$SEED  Samples=$N_SAMPLES  Rounds=$ROUNDS"
-echo "Started: $(date)"
-echo "========================================"
+# ── Colors for terminal output ─────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'  # No color
 
-# ── 1. Generate data (~1 min) ──────────────────────────────────
-echo ""
-echo "[1/8] Generating data..."
-python data/generator/generate.py --n-samples $N_SAMPLES --seed $SEED
+log_step() { echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${GREEN}[STEP]${NC} $1"; echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
+log_info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
+log_done() { echo -e "${GREEN}[DONE]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# ── 2. Centralized baseline (~3 min) ──────────────────────────
-echo ""
-echo "[2/8] Centralized baseline..."
-python -m securerelayfl.models.train_centralized \
-    --model $MODEL --epochs $EPOCHS --seed $SEED
+# ── Parse arguments ────────────────────────────────────────────
+SKIP_DATA=false
+ONLY_FIGURES=false
 
-# ── 3. Local-only baselines (~10 min) ─────────────────────────
-echo ""
-echo "[3/8] Local-only baselines..."
-for f in 0 1 2 3 4; do
-    echo "  Facility $f..."
-    python -m securerelayfl.models.train_centralized \
-        --model $MODEL --facility $f --epochs $EPOCHS --seed $SEED
+for arg in "$@"; do
+    case $arg in
+        --skip-data) SKIP_DATA=true ;;
+        --only-figures) ONLY_FIGURES=true ;;
+        --help|-h)
+            echo "Usage: ./run_all.sh [--skip-data] [--only-figures]"
+            echo "  --skip-data     Skip data generation (use existing data/)"
+            echo "  --only-figures  Only regenerate figures from existing results/"
+            exit 0 ;;
+        *) log_error "Unknown argument: $arg"; exit 1 ;;
+    esac
 done
 
-# ── 4. FedAvg ideal (~30 min) ─────────────────────────────────
+# ── Timing ─────────────────────────────────────────────────────
+PIPELINE_START=$(date +%s)
+step_timer() {
+    local start=$1
+    local end=$(date +%s)
+    local elapsed=$((end - start))
+    echo -e "${YELLOW}  Elapsed: ${elapsed}s${NC}"
+}
+
+# ── Environment check ──────────────────────────────────────────
+log_step "Checking environment"
+
+python3 -c "import torch; print(f'  PyTorch {torch.__version__}')" || {
+    log_error "PyTorch not found. Install: pip install -r requirements.txt"
+    exit 1
+}
+python3 -c "import flwr; print(f'  Flower {flwr.__version__}')" || {
+    log_error "Flower not found. Install: pip install -r requirements.txt"
+    exit 1
+}
+python3 -c "import matplotlib; print(f'  Matplotlib {matplotlib.__version__}')"
+
+log_info "Device: $(python3 -c "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')")"
+log_info "Seed: ${SEED}"
+
+# ── Create output directories ──────────────────────────────────
+mkdir -p data results figures
+
+if [ "$ONLY_FIGURES" = true ]; then
+    log_step "Generating figures only (--only-figures)"
+    if [ ! -d "results/axis1_impairment" ]; then
+        log_error "No results found. Run full pipeline first."
+        exit 1
+    fi
+    python3 figures/gen_figures.py
+    log_done "Figures generated in figures/"
+    exit 0
+fi
+
+# ════════════════════════════════════════════════════════════════
+# STEP 1: Data Generation
+# ════════════════════════════════════════════════════════════════
+if [ "$SKIP_DATA" = false ]; then
+    log_step "1/7 — Generating synthetic EMT waveforms"
+    log_info "${N_FACILITIES} facilities × 3 configs × ${SAMPLES_PER_FACILITY} samples"
+    STEP_START=$(date +%s)
+
+    python3 -m src.securerelayfl.experiments.generate_data \
+        --seed ${SEED} \
+        --samples ${SAMPLES_PER_FACILITY} \
+        --output data/
+
+    step_timer $STEP_START
+    log_done "Data saved to data/"
+else
+    log_info "Skipping data generation (--skip-data)"
+fi
+
+# ════════════════════════════════════════════════════════════════
+# STEP 2: Centralized Baseline
+# ════════════════════════════════════════════════════════════════
+log_step "2/7 — Training centralized baseline"
+STEP_START=$(date +%s)
+
+python3 -m src.securerelayfl.experiments.train_centralized \
+    --data data/ \
+    --output results/cnn_v2_centralized \
+    --epochs 50 \
+    --batch-size ${BATCH_SIZE} \
+    --lr ${LR} \
+    --seed ${SEED}
+
+step_timer $STEP_START
+log_done "Centralized model saved"
+
+# ════════════════════════════════════════════════════════════════
+# STEP 3: Local Baselines (per-facility)
+# ════════════════════════════════════════════════════════════════
+log_step "3/7 — Training local baselines (5 facilities)"
+STEP_START=$(date +%s)
+
+for i in $(seq 0 4); do
+    log_info "  Facility ${i}..."
+    python3 -m src.securerelayfl.experiments.train_local \
+        --data data/ \
+        --facility ${i} \
+        --output results/cnn_v2_facility_${i} \
+        --epochs 50 \
+        --batch-size ${BATCH_SIZE} \
+        --lr ${LR} \
+        --seed ${SEED}
+done
+
+step_timer $STEP_START
+log_done "Local models saved"
+
+# ════════════════════════════════════════════════════════════════
+# STEP 4: Federated Learning — FedAvg + FedProx
+# ════════════════════════════════════════════════════════════════
+log_step "4/7 — Federated learning (FedAvg + FedProx)"
+STEP_START=$(date +%s)
+
+log_info "  FedAvg (${FL_ROUNDS} rounds)..."
+python3 -m src.securerelayfl.experiments.train_fedavg \
+    --data data/ \
+    --output results/cnn_v2_fedavg \
+    --rounds ${FL_ROUNDS} \
+    --local-epochs ${LOCAL_EPOCHS} \
+    --batch-size ${BATCH_SIZE} \
+    --lr ${LR} \
+    --seed ${SEED}
+
+log_info "  FedProx (μ=0.01, ${FL_ROUNDS} rounds)..."
+python3 -m src.securerelayfl.experiments.train_fedprox \
+    --data data/ \
+    --output results/cnn_v2_fedprox \
+    --rounds ${FL_ROUNDS} \
+    --local-epochs ${LOCAL_EPOCHS} \
+    --batch-size ${BATCH_SIZE} \
+    --lr ${LR} \
+    --mu 0.01 \
+    --seed ${SEED}
+
+step_timer $STEP_START
+log_done "FL experiments complete"
+
+# ════════════════════════════════════════════════════════════════
+# STEP 5: Axis 1 — Network Impairment Sweep
+# ════════════════════════════════════════════════════════════════
+log_step "5/7 — Axis 1: Network impairment sweep"
+log_info "  Packet loss: [0, 5, 10, 15, 25]%"
+log_info "  Quantization: [32, 16, 8] bit"
+log_info "  Channel noise: [0, 0.001, 0.01]"
+STEP_START=$(date +%s)
+
+python3 -m src.securerelayfl.experiments.sweep_impairments \
+    --data data/ \
+    --output results/axis1_impairment \
+    --rounds ${FL_ROUNDS} \
+    --seed ${SEED}
+
+step_timer $STEP_START
+log_done "Impairment sweep complete"
+
+# ════════════════════════════════════════════════════════════════
+# STEP 6: Axis 2 — Differential Privacy Sweep
+# ════════════════════════════════════════════════════════════════
+log_step "6/7 — Axis 2: Differential privacy sweep"
+log_info "  ε ∈ {0.5, 1.0, 2.0, 5.0, 10.0, ∞}"
+STEP_START=$(date +%s)
+
+python3 -m src.securerelayfl.experiments.sweep_privacy \
+    --data data/ \
+    --output results/axis2_privacy \
+    --rounds ${FL_ROUNDS} \
+    --seed ${SEED}
+
+step_timer $STEP_START
+log_done "DP sweep complete"
+
+# ════════════════════════════════════════════════════════════════
+# STEP 7: Generate Publication Figures
+# ════════════════════════════════════════════════════════════════
+log_step "7/7 — Generating publication figures"
+STEP_START=$(date +%s)
+
+python3 figures/gen_figures.py
+
+step_timer $STEP_START
+log_done "Figures saved to figures/"
+
+# ════════════════════════════════════════════════════════════════
+# SUMMARY
+# ════════════════════════════════════════════════════════════════
+PIPELINE_END=$(date +%s)
+TOTAL_ELAPSED=$((PIPELINE_END - PIPELINE_START))
+
 echo ""
-echo "[4/8] FedAvg ideal..."
-python -m securerelayfl.fl.server \
-    --model $MODEL --rounds $ROUNDS --local-epochs 1 \
-    --lr $LR --seed $SEED
-
-# ── 5. FedProx (~30 min) ──────────────────────────────────────
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  SecureRelayFL — Pipeline Complete${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
 echo ""
-echo "[5/8] FedProx (mu=0.01)..."
-python -m securerelayfl.fl.server \
-    --model $MODEL --rounds $ROUNDS --local-epochs 1 \
-    --lr $LR --fedprox-mu 0.01 --seed $SEED \
-    --output-dir results/cnn_v2_fedprox
-
-# ── 6. Axis 1: Impairment sweep (~1.5 hrs) ────────────────────
+echo -e "  Total time: ${YELLOW}${TOTAL_ELAPSED}s${NC} ($((TOTAL_ELAPSED/60))m $((TOTAL_ELAPSED%60))s)"
 echo ""
-echo "[6/8] Axis 1 — Impairment sweep..."
-python -m securerelayfl.experiments.axis1_impairment \
-    --model $MODEL --rounds $ROUNDS --lr $LR --seed $SEED
-
-# ── 7. Axis 2: DP sweep (~2 hrs) ──────────────────────────────
+echo "  Results:  results/"
+echo "  Figures:  figures/"
 echo ""
-echo "[7/8] Axis 2 — DP privacy sweep..."
-python -m securerelayfl.experiments.axis2_privacy \
-    --model $MODEL --rounds $ROUNDS --lr $LR --seed $SEED \
-    --n-samples $(( N_SAMPLES * 5 ))
-
-# ── 8. GOOSE dual-layer analysis (~seconds) ───────────────────
+echo "  Key outputs:"
+echo "    results/cnn_v2_centralized/    Centralized baseline"
+echo "    results/cnn_v2_facility_*/     Local baselines (×5)"
+echo "    results/cnn_v2_fedavg/         FedAvg (50 rounds)"
+echo "    results/cnn_v2_fedprox/        FedProx (μ=0.01)"
+echo "    results/axis1_impairment/      Network impairment sweep"
+echo "    results/axis2_privacy/         DP epsilon sweep"
 echo ""
-echo "[8/8] GOOSE dual-layer analysis..."
-python -m securerelayfl.analysis.goose_dual_layer
-
-# ── Summary ────────────────────────────────────────────────────
+echo "    figures/fig_waveforms.pdf      Synthetic EMT waveforms"
+echo "    figures/fig_convergence.pdf    FL convergence curves"
+echo "    figures/fig_impairment_heatmap.pdf  Packet loss × quantization"
+echo "    figures/fig_dp_analysis.pdf    DP impact analysis"
+echo "    figures/fig_heterogeneity.pdf  Per-facility comparison"
+echo "    figures/fig_goose_timing.pdf   GOOSE + FL timing diagram"
 echo ""
-echo "========================================"
-echo "All runs complete: $(date)"
-echo "========================================"
-echo ""
-echo "Results summary:"
-echo ""
-
-python -c "
-import json
-from pathlib import Path
-
-def load_metrics(path):
-    p = Path(path)
-    if (p / 'metrics.json').exists():
-        with open(p / 'metrics.json') as f:
-            return json.load(f)
-    if (p / 'round_metrics.json').exists():
-        with open(p / 'round_metrics.json') as f:
-            rounds = json.load(f)
-            return rounds[-1] if rounds else {}
-    return {}
-
-print('─' * 65)
-print(f'{\"Setting\":<30} {\"FT Acc\":>8} {\"FZ Acc\":>8} {\"PA Acc\":>8}')
-print('─' * 65)
-
-# Centralized
-m = load_metrics('results/cnn_v2_centralized')
-final = m.get('final', m)
-print(f'{\"Centralized\":<30} {final.get(\"acc_ft\",0):>8.3f} {final.get(\"acc_fz\",0):>8.3f} {final.get(\"acc_pa\",0):>8.3f}')
-
-# Local-only
-pa_locals = []
-for f in range(5):
-    m = load_metrics(f'results/cnn_v2_facility_{f}')
-    final = m.get('final', m)
-    pa = final.get('acc_pa', 0)
-    pa_locals.append(pa)
-    print(f'{f\"Local F{f}\":<30} {final.get(\"acc_ft\",0):>8.3f} {final.get(\"acc_fz\",0):>8.3f} {pa:>8.3f}')
-if pa_locals:
-    print(f'{\"Local avg\":<30} {\"\":>8} {\"\":>8} {sum(pa_locals)/len(pa_locals):>8.3f}')
-
-# FedAvg
-m = load_metrics('results/cnn_v2_fedavg')
-print(f'{\"FedAvg ideal\":<30} {m.get(\"acc_ft\",0):>8.3f} {m.get(\"acc_fz\",0):>8.3f} {m.get(\"acc_pa\",0):>8.3f}')
-
-# FedProx
-m = load_metrics('results/cnn_v2_fedprox')
-print(f'{\"FedProx (mu=0.01)\":<30} {m.get(\"acc_ft\",0):>8.3f} {m.get(\"acc_fz\",0):>8.3f} {m.get(\"acc_pa\",0):>8.3f}')
-
-print('─' * 65)
-
-# Axis 1 summary
-a1 = Path('results/axis1_impairment/all_results.json')
-if a1.exists():
-    with open(a1) as f:
-        results = json.load(f)
-    print()
-    print('Axis 1 — Impairment Sweep (PA Acc):')
-    print(f'{\"Scenario\":<40} {\"Q32\":>6} {\"Q16\":>6} {\"Q8\":>6}')
-    print('─' * 60)
-    by_pl = {}
-    for r in results:
-        pl = r['packet_loss']
-        qb = r['quant_bits']
-        ns = r['noise_scale']
-        if ns == 0:
-            by_pl.setdefault(pl, {})[qb] = r.get('acc_pa', 0)
-    for pl in sorted(by_pl):
-        label = r.get('scenario', '') if pl == r.get('packet_loss') else f'{pl:.0%} loss'
-        for r2 in results:
-            if r2['packet_loss'] == pl and r2['noise_scale'] == 0:
-                label = r2.get('scenario', f'{pl:.0%} loss')
-                break
-        q32 = by_pl[pl].get(32, 0)
-        q16 = by_pl[pl].get(16, 0)
-        q8 = by_pl[pl].get(8, 0)
-        print(f'{label:<40} {q32:>6.3f} {q16:>6.3f} {q8:>6.3f}')
-
-# Axis 2 summary
-a2 = Path('results/axis2_privacy/all_results.json')
-if a2.exists():
-    with open(a2) as f:
-        results = json.load(f)
-    print()
-    print('Axis 2 — DP Privacy Sweep:')
-    print(f'{\"Epsilon\":<15} {\"Noise σ\":>10} {\"PA Acc\":>8}')
-    print('─' * 35)
-    for r in results:
-        eps = r['epsilon']
-        eps_str = f'{eps:.1f}' if eps != float('inf') else '∞ (no DP)'
-        print(f'{eps_str:<15} {r[\"noise_multiplier\"]:>10.4f} {r.get(\"acc_pa\",0):>8.3f}')
-"
