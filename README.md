@@ -2,7 +2,7 @@
 
 **Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks**
 
-[![Paper](https://img.shields.io/badge/Paper-MAIN%202026-blue)](https://main2026.ieee-comsoc.org/)
+[![Paper Submitted](https://img.shields.io/badge/Paper-MPCE-blue)](https://www.mpce.info/mpce/home)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Flower](https://img.shields.io/badge/Flower-1.12-orange.svg)](https://flower.ai/)
@@ -251,9 +251,8 @@ If you use this work, please cite:
   title={Privacy-Preserving Adaptive Relay Settings via Federated Learning
          Over Industrial Communication Networks},
   author={Ramharack, Shankar},
-  booktitle={Proc. IEEE MAIN},
+  booktitle={Submitted to Journal of Modern Power Systems and Clean Energy},
   year={2026},
-  address={Palermo, Italy}
 }
 ```
 
