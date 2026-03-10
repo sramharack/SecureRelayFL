@@ -2,7 +2,6 @@
 
 **Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks**
 
-[![Paper Submitted](https://img.shields.io/badge/Paper-MPCE-blue)](https://www.mpce.info/mpce/home)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Flower](https://img.shields.io/badge/Flower-1.12-orange.svg)](https://flower.ai/)
@@ -247,12 +246,12 @@ This is **40× below** the IEC 61850-5 Type 1A transfer time requirement of ≤ 
 If you use this work, please cite:
 
 ```bibtex
-@inproceedings{ramharack2026securerelayfl,
-  title={Privacy-Preserving Adaptive Relay Settings via Federated Learning
-         Over Industrial Communication Networks},
-  author={Ramharack, Shankar},
-  booktitle={Submitted to Journal of Modern Power Systems and Clean Energy},
-  year={2026},
+@misc{ramharack2026securerelayfl_repo,
+  author       = {Ramharack, Shankar},
+  title        = {SecureRelayFL: Privacy-Preserving Adaptive Relay Settings via Federated Learning Over Industrial Communication Networks},
+  year         = {2026},
+  howpublished = {\url{https://github.com/sramharack/SecureRelayFL}},
+  note         = {GitHub repository}
 }
 ```
 
